@@ -26,6 +26,7 @@ from .geom import (
     rad2deg,
 )
 from .obstacles import Obstacle, collect_obstacles, detour
+from .path_planner import plan_global_path
 
 __all__ = [
     "Obstacle",
@@ -40,5 +41,6 @@ __all__ = [
     "opponent_goal",
     "own_goal",
     "own_goal_area_center",
+    "plan_global_path",
     "rad2deg",
 ]

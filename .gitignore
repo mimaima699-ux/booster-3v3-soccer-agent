@@ -154,3 +154,6 @@ Thumbs.db
 old_src/*
 ref/*
 
+
+# Local reference clone of the official soccersim repo (kept out of this strategy repo)
+soccersim/

@@ -121,6 +121,7 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.prev_phase = None       # Previous phase, used to detect transitions
         store.cur_phase = None
         store.kickoff_taker = None    # Locked taker ID, reselected for each kickoff
+        store.kickoff_zone_active = False  # Two-touch rule until ball leaves kickoff zone
         store.normal_attacker = None
 
     @staticmethod
@@ -218,6 +219,31 @@ def _fallen_time_cost(p: Player) -> float:
     return FALLEN_COST if p.is_fallen else 0.0
 
 
+def _assign_to_slots(
+    context: Context,
+    players: list[Player],
+    slots: list[tuple[float, float]],
+    action_label: str,
+) -> None:
+    """Greedily assign each player to the nearest remaining slot by distance.
+
+    This avoids cross-field travel by matching players to the closest
+    unclaimed target, regardless of list order.
+    """
+    available = list(enumerate(slots))
+    for p in players:
+        if not available:
+            break
+        # Find the nearest remaining slot.
+        best_idx, best_target = min(
+            available,
+            key=lambda item: _player_dist_to_position(p, item[1]),
+        )
+        p.action = action_label
+        p.walk_to(best_target, face=0.0, avoid_ball=True, avoid_robots=True)
+        available.remove((best_idx, best_target))
+
+
 def _select_closest_attacker(
     context: Context,
     players: list[Player],
@@ -239,6 +265,50 @@ def _select_closest_attacker(
     return best
 
 
+def _check_inactivity(context: Context, players: list[Player], store) -> None:
+    """M-05 protection: reposition robots that stay too still near the ball.
+
+    The referee may penalize a robot within 3 m of the ball that shows
+    almost no displacement for 10 s (local game stuck).  We track each
+    player's position and, when the inactivity alert threshold is exceeded,
+    command a short reposition to reset the displacement counter.
+    """
+    ball = context.ball
+    if ball is None:
+        return
+    now = context.now
+    for p in players:
+        pose = p.pose
+        if pose is None:
+            continue
+        # Only players near the ball are subject to M-05.
+        if dist(pose.x, pose.y, ball.x, ball.y) > BALL_NEAR_RADIUS_M:
+            p._inactivity_pos = None
+            p._inactivity_since = None
+            continue
+        # Initialise or update tracking.
+        if p._inactivity_pos is None or p._inactivity_since is None:
+            p._inactivity_pos = (pose.x, pose.y)
+            p._inactivity_since = now
+        else:
+            last_x, last_y = p._inactivity_pos
+            moved = dist(pose.x, pose.y, last_x, last_y)
+            if moved >= INACTIVITY_MIN_DISPLACEMENT_M:
+                # Meaningful movement — reset the timer.
+                p._inactivity_pos = (pose.x, pose.y)
+                p._inactivity_since = now
+            elif now - p._inactivity_since > INACTIVITY_ALERT_S:
+                # Too still — nudge slightly away from the current position
+                # to break the inactivity window.
+                offset_x = pose.x + (0.6 if p.id % 2 == 0 else -0.6)
+                offset_y = pose.y + (0.4 if p.id % 3 == 0 else -0.4)
+                target = clamp_inside_field(context, offset_x, offset_y, margin=0.5)
+                p.action = "inactive:reposition"
+                p.walk_to(target, face=0.0, avoid_ball=True, avoid_robots=True)
+                p._inactivity_pos = (pose.x, pose.y)
+                p._inactivity_since = now
+
+
 def _act_normal(context: Context, players: list[Player], store) -> None:
     """Assign the nearest player to attack, the next to guard, and others to support.
 
@@ -248,19 +318,32 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
     if not players:
         return
 
+    # Two-touch kickoff aftermath: while the ball is still inside the kickoff
+    # zone after our kickoff, keep clearing it out before anyone shoots.
+    # Only a seen ball outside the zone clears the flag; a lost ball keeps
+    # the gate closed so no shot happens on a stale or missing position.
+    if getattr(store, "kickoff_zone_active", False):
+        ball = context.ball
+        if ball is not None and dist(ball.x, ball.y, 0.0, 0.0) > KICKOFF_CLEAR_RADIUS_M:
+            store.kickoff_zone_active = False
+
     attacker = _select_closest_attacker(
         context, players, getattr(store, "normal_attacker", None),
     )
     store.normal_attacker = attacker.id
-    attacker.action = "attack"
-    attacker.attack()
+    if getattr(store, "kickoff_zone_active", False):
+        attacker.action = "kickoff:push"
+        attacker.kickoff_push()
+    else:
+        attacker.action = "attack"
+        attacker.attack()
 
     # The remaining player nearest our goal becomes the guard.
     rest = [p for p in players if p is not attacker]
     if rest:
         gx, gy = own_goal(context)
         guard = min(rest, key=lambda p: _player_dist_to_position(p, (gx, gy)))
-        guard.guard()  
+        guard.guard()
         rest = [p for p in rest if p is not guard]
 
     # All other players support.
@@ -268,9 +351,19 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
         p.action = "support"
         p.support()
 
+    # M-05 inactivity protection: robots near the ball must keep moving.
+    # If any player has been nearly stationary inside the 3 m ball radius
+    # for too long, reposition to avoid a local-game-stuck penalty.
+    _check_inactivity(context, players, store)
+
 
 def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
-    """Lock the nearest kickoff taker, assign a guard, and leave others in support."""
+    """Lock the nearest kickoff taker, assign a guard, and leave others in support.
+
+    Two-touch kickoff rule: the taker first pushes the ball out of the
+    kickoff zone around the center spot along a non-scoring line, then
+    switches to a normal attack once the ball has left the zone.
+    """
     if not players:
         return
 
@@ -284,8 +377,17 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
     if attacker is None:
         return
 
-    attacker.action = "kickoff"
-    attacker.kick(0.1, KICK_POWER_OUR_KICKOFF)
+    ball = context.ball
+    if ball is not None and dist(ball.x, ball.y, 0.0, 0.0) > KICKOFF_CLEAR_RADIUS_M:
+        # The ball has left the kickoff zone; goals now count normally.
+        store.kickoff_zone_active = False
+        attacker.action = "kickoff:go"
+        attacker.attack()
+    else:
+        # First touch: push the ball out of the zone along a non-scoring line.
+        store.kickoff_zone_active = True
+        attacker.action = "kickoff:push"
+        attacker.kickoff_push()
 
     rest = [p for p in players if p is not attacker]
     if rest:
@@ -294,9 +396,21 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         guard.guard()
         rest = [p for p in rest if p is not guard]
 
-    for p in rest:
-        p.action = "stay"
-        p.stop()
+    # Non-taker teammates must stay outside the center circle (P-02).
+    # Move them to positions behind the circle instead of just stopping in
+    # place, in case they were still inside from the READY phase.
+    circle_r = context.field.circle_radius
+    kickoff_wait_slots = [
+        (-circle_r - 0.5, 0.0),
+        (-circle_r - 1.5, 0.8),
+    ]
+    for p, target in zip(rest, kickoff_wait_slots):
+        p.action = "kickoff:wait"
+        p.walk_to(target, avoid_ball=True, avoid_robots=True)
+    # Any remaining players (shouldn't happen in 3v3) also move out.
+    for p in rest[len(kickoff_wait_slots):]:
+        p.action = "kickoff:wait"
+        p.walk_to((-circle_r - 0.5, 0.0), avoid_ball=True, avoid_robots=True)
 
 
 def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
@@ -316,17 +430,14 @@ def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
 
 
 def _act_our_set_play(context: Context, players: list[Player], store) -> None:
-    """Dispatch our set play by type. TODO: add strategy; defaults to normal."""
-    set_play = get_set_play_type(context)
-    if set_play == SetPlay.THROW_IN:
-        _act_normal(context, players, store)
-        return
-    if set_play == SetPlay.CORNER_KICK:
-        _act_normal(context, players, store)
-        return
-    if set_play == SetPlay.GOAL_KICK:
-        _act_normal(context, players, store)
-        return
+    """Dispatch our set play with own-goal avoidance for indirect restarts.
+
+    THROW_IN, GOAL_KICK, and CORNER_KICK cannot score directly into our own
+    goal (G-04): the first touch must go away from our goal.  For these we
+    use the normal attack flow, which aims at the opponent goal and
+    inherently avoids our own.  Other set plays (free kicks, penalties)
+    also default to normal play for now.
+    """
     _act_normal(context, players, store)
 
 
@@ -387,68 +498,25 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
 
 
 def _act_ready(context: Context, players: list[Player]) -> None:
-    """Move each player to a ready position."""
+    """Move each player to a ready position, assigning by distance not index."""
     game = context.game
     our_kickoff = game is not None and game.kicking_team == context.team_id
     field = context.field
     # Our kickoff priority: center-circle edge, goal-area center, then left side.
     if our_kickoff:
-        if len(players) >= 1:
-            p1 = players[0]
-            p1.action = "ready"
-            p1.walk_to(
-                (-field.circle_radius, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 2:
-            p2 = players[1]
-            p2.action = "ready"
-            p2.walk_to(
-                (-field.length / 2.0 + field.goal_area_length, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 3:
-            p3 = players[2]
-            p3.action = "ready"
-            p3.walk_to(
-                (-0.5, field.circle_radius + 2),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
+        slots = [
+            (-field.circle_radius, 0.0),
+            (-field.length / 2.0 + field.goal_area_length, 0.0),
+            (-0.5, field.circle_radius + 2),
+        ]
     # Opponent kickoff priority: outside center circle, goal area, then penalty area.
     else:
-        if len(players) >= 1:
-            p1 = players[0]
-            p1.action = "ready"
-            p1.walk_to(
-                (-field.circle_radius - 0.5, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 2:
-            p2 = players[1]
-            p2.action = "ready"
-            p2.walk_to(
-                (-field.length / 2.0 + field.goal_area_length, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 3:
-            p3 = players[2]
-            p3.action = "ready"
-            p3.walk_to(
-                (-field.length / 2.0 + field.penalty_area_length, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
+        slots = [
+            (-field.circle_radius - 0.5, 0.0),
+            (-field.length / 2.0 + field.goal_area_length, 0.0),
+            (-field.length / 2.0 + field.penalty_area_length, 0.0),
+        ]
+    _assign_to_slots(context, players, slots, "ready")
 
 
 

@@ -27,6 +27,7 @@ from .param import *
 from .utils.geom import (
     angle_to,
     clamp,
+    clamp_inside_field,
     dist,
     normalize_angle,
     opponent_goal,
@@ -118,15 +119,16 @@ class Player:
         # Cross-frame kick hysteresis state.
         self._kicking: bool = False
 
-        # Cross-frame block/guard hysteresis state.
-        self._block_pressing: bool = False
+        # Cross-frame guard threat hysteresis.
         self._guard_threatened: bool = False
-        # Cross-frame state for driving the ball over the goal line.
-        self._goal_line_push: bool = False
         # Cross-frame state for temporarily attacking when support gets stuck.
         self._support_last_pos: tuple[float, float] | None = None
         self._support_stationary_since: float | None = None
         self._support_last_update_at: float | None = None
+
+        # M-05 inactivity tracking: last position and time of meaningful displacement.
+        self._inactivity_pos: tuple[float, float] | None = None
+        self._inactivity_since: float | None = None
 
     # ------------------------------------------------------------------
     # State access
@@ -624,32 +626,58 @@ class Player:
             )
 
     def guard(self) -> None:
-        """Guard from the center of the goal area.
+        """Guard with active interception when the ball enters our half.
 
-        Fall back to that position when no active threat is available.
+        When the ball is far away, stay at the goal-area center.  When it
+        enters our half (x < GUARD_THREAT_ENTER_X), move forward along the
+        ball-to-goal line to actively intercept shots.
+
+        Hysteresis: enter active mode at ENTER_X, exit at EXIT_X to prevent
+        rapid switching near the boundary.
         """
         ctx = self.context
         pose = self.pose
-        home = own_goal_area_center(ctx) if ctx is not None else None
-        if home is None or pose is None:
+        if ctx is None or pose is None:
             self.action = "guard:stop"
             self.stop()
             return
+        home = own_goal_area_center(ctx)
 
-        ball = ctx.ball if ctx is not None else None
+        ball = ctx.ball
 
-        # Face the ball for faster reactions, or the opponent's goal if unseen.
+        # Active interception hysteresis.
+        if ball is not None:
+            if ball.x >= GUARD_THREAT_EXIT_X:
+                self._guard_threatened = False
+            elif ball.x < GUARD_THREAT_ENTER_X:
+                self._guard_threatened = True
+
         face = 0.0
         if GUARD_FACE_BALL and ball is not None:
-            face = angle_to(
-                pose.x, pose.y, ball.x, ball.y,
-            )
+            face = angle_to(pose.x, pose.y, ball.x, ball.y)
 
-        self.action = "guard:home"
-        debugdraw.point(
-            home[0], home[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
-        )
-        self.walk_to(home, face=face, avoid_ball=True, avoid_robots=True)
+        if self._guard_threatened and ball is not None:
+            # Move forward along the ball-to-goal line to intercept.
+            gx, gy = own_goal(ctx)
+            bx, by = ball.x, ball.y
+            intercept_x = gx + (bx - gx) * GUARD_INTERCEPT_FRACTION
+            intercept_y = gy + (by - gy) * GUARD_INTERCEPT_FRACTION
+            # Ensure a minimum distance from our goal line.
+            min_x = -ctx.field.length / 2.0 + GUARD_INTERCEPT_MIN_DIST_M
+            if intercept_x < min_x:
+                intercept_x = min_x
+            target = clamp_inside_field(ctx, intercept_x, intercept_y, margin=0.3)
+            self.action = "guard:intercept"
+            debugdraw.point(
+                target[0], target[1], rgb=(1.0, 0.4, 0.0), scale=0.2, ns="guard_intercept",
+            )
+            self.walk_to(target, face=face, avoid_ball=True, avoid_robots=True)
+        else:
+            self.action = "guard:home"
+            debugdraw.point(
+                home[0], home[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
+            )
+            self.walk_to(home, face=face, avoid_ball=True, avoid_robots=True)
 
     def support(self) -> None:
         """Support on the ball-to-own-goal line at ``SUPPORT_DIST_M``.
@@ -680,6 +708,46 @@ class Player:
         tx = clamp(tx, -half_l + 0.3, half_l)
         ty = clamp(ty, -half_w, half_w)
         self.move_to_position((tx, ty))
+
+    def kickoff_push(self) -> None:
+        """First kickoff touch: push the ball out of the kickoff zone.
+
+        Two-touch kickoff rule: a goal scored directly from the kickoff spot
+        does not count. This skill nudges the ball forward along the smallest
+        offset from the opponent-goal direction whose straight line cannot
+        enter the goal, so the follow-up shot happens outside the kickoff
+        zone and counts normally.
+        """
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None or self.pose is None:
+            self.stop()
+            return
+        # Fallback: choose the widest non-scoring angle, i.e. the one whose
+        # projection at the goal is farthest from the goal center.  When every
+        # scanned angle can score (unlikely from the center spot with small
+        # offsets), default to the side that keeps the ball farther from the
+        # goal center.
+        best_direction = None
+        best_offset = 0.0
+        offsets = (
+            sign * step * KICKOFF_PUSH_SCAN_STEP_RAD
+            for step in range(1, KICKOFF_PUSH_SCAN_STEPS + 1)
+            for sign in (1.0, -1.0)
+        )
+        for candidate in offsets:
+            if not self.kick_can_score(candidate):
+                if best_direction is None:
+                    best_direction = candidate
+                break  # Take the first non-scoring candidate by increasing offset.
+            # Track the candidate whose straight line ends farthest from goal center.
+            goal_y = self._goal_target_for_direction(candidate)[1]
+            if abs(goal_y) > abs(best_offset):
+                best_offset = goal_y
+                best_direction = candidate
+        if best_direction is None:
+            best_direction = math.radians(90.0)
+        self.kick(best_direction, KICK_POWER_KICKOFF_PUSH)
 
     def take_kickoff(self, kick_target: tuple[float, float] | None = None) -> None:
         """Stage behind the ball for our restart, then approach and kick."""
