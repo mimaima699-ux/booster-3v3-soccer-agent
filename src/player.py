@@ -33,6 +33,7 @@ from .utils.geom import (
     opponent_goal,
     own_goal,
     own_goal_area_center,
+    segment_point_distance,
 )
 from .utils.obstacles import collect_obstacles
 from .utils.path_planner import plan_global_path
@@ -240,27 +241,174 @@ class Player:
         self._backend.kick(direction_body, power_clamped, ball_x_body, ball_y_body)
 
     def plan_kick(self) -> tuple[float, float] | None:
-        """Calculate kick direction and power.
+        """Decide this frame's kick direction and power.
 
-        Aim from the current ball position toward the opponent's goal center.
-        Return ``(kick_direction, kick_power)``, or None when the ball or context
-        is unavailable.
+        Decision ladder, safest option first:
+        1. Shot: only when the straight ball line can enter the goal mouth
+           and the goal is within ``SHOT_MAX_RANGE_M``. Near the sideline a
+           shot across field is never taken.
+        2. Pass: best forward teammate with a clear receive lane.
+        3. Carry: low-power nudge forward-infield, keeping possession.
+
+        Returns ``(kick_direction, kick_power)``, or None when the ball or
+        context is unavailable.
         """
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
         if ctx is None or ball is None:
             return None
 
-        kick_target = opponent_goal(ctx)
-        kick_direction = angle_to(ball.x, ball.y, *kick_target)
-        kick_target = self._goal_target_for_direction(kick_direction)
-        kick_power = (
-            KICK_POWER_BACKFIELD if self._in_backfield()
-            else KICK_POWER_DEFAULT
+        near_sideline = (
+            abs(ball.y) > ctx.field.width / 2.0 - SIDELINE_RECOVER_Y_M
         )
+        goal_x = ctx.field.length / 2.0
+        shot_range = dist(ball.x, ball.y, goal_x, 0.0)
 
-        self._draw_kick_target(kick_target)
-        return kick_direction, kick_power
+        shot = None
+        if not near_sideline and shot_range <= SHOT_MAX_RANGE_M:
+            shot = self._best_shot()
+        if shot is not None:
+            self._draw_kick_target(shot)
+            return angle_to(ball.x, ball.y, shot[0], shot[1]), SHOT_POWER
+
+        mate = self._best_pass_target()
+        if mate is not None:
+            pass_distance = dist(ball.x, ball.y, mate[0], mate[1])
+            pass_power = clamp(
+                PASS_POWER_MIN + PASS_POWER_PER_M * pass_distance,
+                PASS_POWER_MIN, PASS_POWER_MAX,
+            )
+            self._draw_kick_target(mate)
+            return angle_to(ball.x, ball.y, mate[0], mate[1]), pass_power
+
+        carry = self._carry_target()
+        self._draw_kick_target(carry)
+        return angle_to(ball.x, ball.y, carry[0], carry[1]), CARRY_POWER
+
+    def _best_shot(self) -> tuple[float, float] | None:
+        """Best aim point across the opponent goal mouth, or None.
+
+        Scans aim points inside the posts (each validated with
+        ``kick_can_score``) and ranks them by lane clearance from opponents
+        blended with openness (distance from the nearest opponent to the aim
+        point), so shots go to the corner the goalkeeper covers least.
+        Candidates below ``SHOT_MIN_LANE_SCORE`` are rejected; None means no
+        candidate qualifies and the caller should pass or carry instead.
+        """
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None:
+            return None
+
+        goal_x = ctx.field.length / 2.0
+        reach = max(0.0, ctx.field.goal_width / 2.0 - SHOT_POST_MARGIN_M)
+        steps = max(1, int(reach / SHOT_SCAN_STEP_M))
+        opponents = [
+            (robot.pose.x, robot.pose.y)
+            for robot in ctx.opponents.values()
+            if robot.pose is not None
+        ]
+
+        best: tuple[float, tuple[float, float]] | None = None
+        for index in range(-steps, steps + 1):
+            aim_y = reach * index / steps
+            if not self.kick_can_score(
+                angle_to(ball.x, ball.y, goal_x, aim_y)
+            ):
+                continue
+            lane = 1.0
+            openness = 1.0
+            if opponents:
+                nearest = math.inf
+                lane_min = math.inf
+                for ox, oy in opponents:
+                    distance, t = segment_point_distance(
+                        ball.x, ball.y, goal_x, aim_y, ox, oy,
+                    )
+                    nearest = min(nearest, distance)
+                    if t >= 0.1:
+                        lane_min = min(lane_min, distance)
+                if lane_min < SHOT_LANE_CLEAR_REF_M * SHOT_MIN_LANE_SCORE:
+                    continue  # This corner is too well blocked.
+                lane = clamp(lane_min / SHOT_LANE_CLEAR_REF_M, 0.0, 1.0)
+                openness = clamp(nearest / SHOT_OPEN_REF_M, 0.0, 1.0)
+            score = (1.0 - SHOT_OPEN_WEIGHT) * lane + SHOT_OPEN_WEIGHT * openness
+            if best is None or score > best[0]:
+                best = (score, (goal_x, aim_y))
+        return None if best is None else best[1]
+
+    def _best_pass_target(self) -> tuple[float, float] | None:
+        """Pick the best forward teammate to pass to, or None.
+
+        A valid receiver has a known pose, is not penalized, is at least
+        ``PASS_MIN_FORWARD_M`` ahead of the ball, and has a receive lane at
+        least ``PASS_LANE_CLEARANCE_M`` from every opponent. Among valid
+        receivers, prefer the furthest forward with a central preference.
+        """
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None:
+            return None
+
+        best: tuple[float, tuple[float, float]] | None = None
+        game = ctx.game
+        for mate_id, mate in ctx.teammates.items():
+            if mate_id == self.id or mate.pose is None:
+                continue
+            if game is not None:
+                state = game.get_player_state(ctx.team_id, mate_id)
+                if state is not None and state.penalty != Penalty.NONE:
+                    continue
+            forward = mate.pose.x - ball.x
+            if forward < PASS_MIN_FORWARD_M:
+                continue
+            if not self._lane_is_clear(ball.x, ball.y, mate.pose.x, mate.pose.y):
+                continue
+            center_pref = 1.0 - abs(mate.pose.y) / (ctx.field.width / 2.0)
+            score = forward + PASS_CENTER_WEIGHT_M * center_pref
+            if best is None or score > best[0]:
+                best = (score, (mate.pose.x, mate.pose.y))
+        return None if best is None else best[1]
+
+    def _lane_is_clear(
+        self, ax: float, ay: float, bx: float, by: float,
+    ) -> bool:
+        """Whether the ball-to-receiver segment keeps clearance from opponents.
+
+        Opponents projected very close to the segment start (t < 0.1) are
+        ignored: they are contesting the ball itself, and requiring clearance
+        there would cancel every pass.
+        """
+        ctx = self.context
+        if ctx is None:
+            return False
+        for opp in ctx.opponents.values():
+            if opp.pose is None:
+                continue
+            distance, t = segment_point_distance(
+                ax, ay, bx, by, opp.pose.x, opp.pose.y,
+            )
+            if t >= 0.1 and distance < PASS_LANE_CLEARANCE_M:
+                return False
+        return True
+
+    def _carry_target(self) -> tuple[float, float]:
+        """Forward-infield carry target: advance and pull toward the centerline.
+
+        This doubles as the sideline recovery target: near the sideline the
+        center pull dominates, so the ball is nudged back into play instead
+        of being crossed out of bounds.
+        """
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None:
+            return (0.0, 0.0)
+        return clamp_inside_field(
+            ctx,
+            ball.x + CARRY_ADVANCE_M,
+            ball.y * CARRY_CENTER_PULL,
+            margin=0.4,
+        )
 
     def _goal_target_for_direction(
         self, kick_direction: float,
@@ -277,16 +425,6 @@ class Player:
         goal_x = ctx.field.length / 2.0
         t = max(0.0, (goal_x - ball.x) / dx)
         return (goal_x, ball.y + math.sin(kick_direction) * t)
-
-    def _in_backfield(self) -> bool:
-        """Return whether the ball is in our half, where kicks use more power."""
-        ctx = self.context
-        ball = ctx.ball if ctx is not None else None
-        if ctx is None or ball is None:
-            return False
-        # own_penalty_edge_x = -ctx.field.length / 2.0 + ctx.field.penalty_area_length
-        # return ball.x < own_penalty_edge_x
-        return ball.x < 0
 
     def _draw_kick_target(self, target: tuple[float, float]) -> None:
         """Mark the kick target selected by plan_kick with an X."""
@@ -680,14 +818,30 @@ class Player:
             self.walk_to(home, face=face, avoid_ball=True, avoid_robots=True)
 
     def support(self) -> None:
-        """Support on the ball-to-own-goal line at ``SUPPORT_DIST_M``.
+        """Support: offer a forward pass option when attacking, cover the
+        ball-to-own-goal line when defending.
 
-        This places the player on a blocking line between the ball and our goal.
+        Attacking (ball deep in the opponent half): stand ahead-lateral of
+        the ball so the attacker always has a forward receiver with a clear
+        lane. Defending (ball in our half): keep the blocking line between
+        the ball and our goal.
         """
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
         if ctx is None or ball is None:
             self.stop()
+            return
+
+        if ball.x >= SUPPORT_ATTACK_BALL_X:
+            side = -1.0 if ball.y > 0.0 else 1.0  # Offer on the center side.
+            target = clamp_inside_field(
+                ctx,
+                ball.x + SUPPORT_AHEAD_M,
+                ball.y + side * SUPPORT_LATERAL_M,
+                margin=0.35,
+            )
+            self.action = "support:attack"
+            self.move_to_position(target)
             return
 
         gx, gy = own_goal(ctx)

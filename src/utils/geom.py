@@ -38,6 +38,24 @@ def dist(ax: float, ay: float, bx: float, by: float) -> float:
     return math.hypot(ax - bx, ay - by)
 
 
+def segment_point_distance(
+    ax: float, ay: float, bx: float, by: float, px: float, py: float,
+) -> tuple[float, float]:
+    """Distance from point P to segment AB plus the projection parameter.
+
+    Returns ``(distance, t)`` where ``t`` in [0, 1] is how far along the
+    segment the closest point lies. Callers use ``t`` to ignore obstacles
+    hugging the segment start, such as an opponent contesting the ball.
+    """
+    vx, vy = bx - ax, by - ay
+    length_sq = vx * vx + vy * vy
+    if length_sq <= 1e-9:
+        return dist(ax, ay, px, py), 0.0
+    t = ((px - ax) * vx + (py - ay) * vy) / length_sq
+    t = clamp(t, 0.0, 1.0)
+    return dist(ax + vx * t, ay + vy * t, px, py), t
+
+
 def angle_to(fx: float, fy: float, tx: float, ty: float) -> float:
     """Return the field-relative angle from (fx, fy) to (tx, ty)."""
     return math.atan2(ty - fy, tx - fx)

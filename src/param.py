@@ -20,7 +20,43 @@ KICK_POWER_MAX = 10.0
 
 # Kick power during normal play.
 KICK_POWER_DEFAULT = 5.0
-KICK_POWER_BACKFIELD = 7.0
+
+
+# ======================================================================
+# Kick decision ladder: shoot / pass / carry
+# ======================================================================
+
+# Shot: only when the straight ball line can enter the goal mouth AND the
+# goal is within this range. Kicks beyond this range are too inaccurate at
+# full power and mostly end with the ball leaving play.
+SHOT_MAX_RANGE_M = 5.5              # Maximum ball-to-goal-mouth distance for a shot (m)
+SHOT_POWER = 5.0                    # Kick power for a valid shot
+
+# Shot corner aiming: scan the goal mouth and prefer the corner the
+# goalkeeper covers least, instead of always aiming at the center.
+SHOT_POST_MARGIN_M = 0.25           # Keep aim points this far inside each post (m)
+SHOT_SCAN_STEP_M = 0.35             # Spacing between aim-point candidates (m)
+SHOT_MIN_LANE_SCORE = 0.5           # Minimum normalized lane clearance for a candidate
+SHOT_LANE_CLEAR_REF_M = 0.9         # Lane clearance that scores a full 1.0 (m)
+SHOT_OPEN_REF_M = 2.0               # Nearest-opponent distance that scores a full 1.0 (m)
+SHOT_OPEN_WEIGHT = 0.35             # Blend weight of openness vs lane clearance
+
+# Pass: prefer a forward teammate whose receive lane is clear of opponents.
+PASS_MIN_FORWARD_M = 0.5            # Receiver must be at least this far ahead of the ball (m)
+PASS_LANE_CLEARANCE_M = 0.75        # Minimum distance from opponents along the pass lane (m)
+PASS_POWER_MIN = 1.5                # Distance-scaled pass power lower clamp
+PASS_POWER_PER_M = 0.55             # Pass power added per meter of pass distance
+PASS_POWER_MAX = 3.5                # Distance-scaled pass power upper clamp
+PASS_CENTER_WEIGHT_M = 1.2          # Bonus (m) for central receivers when ranking
+
+# Carry: when neither shot nor pass is on, nudge the ball forward-infield
+# with low power and keep chasing, instead of blasting it out of play.
+CARRY_POWER = 2.0                   # Kick power for a carry nudge
+CARRY_ADVANCE_M = 1.2               # How far ahead of the ball the carry target lies (m)
+CARRY_CENTER_PULL = 0.6             # Multiply ball y by this to pull the carry target infield
+
+# Sideline safety: near the sideline never shoot across field; recover infield.
+SIDELINE_RECOVER_Y_M = 1.1          # Distance from the sideline triggering recovery (m)
 
 
 # ======================================================================
@@ -61,6 +97,18 @@ GUARD_THREAT_ENTER_X = -1.0             # Ball crosses this x to trigger active 
 GUARD_THREAT_EXIT_X = -0.7              # Ball crosses this x to resume passive guarding
 
 SUPPORT_DIST_M = 3.0
+
+# Attacking support: when the ball is deep in the opponent half, offer a
+# forward passing option ahead-lateral of the ball instead of only covering
+# the defensive line behind it.
+SUPPORT_ATTACK_BALL_X = 0.5         # Ball x at which support switches to attack offer (m)
+SUPPORT_AHEAD_M = 1.8               # How far ahead of the ball the offer stands (m)
+SUPPORT_LATERAL_M = 1.4             # Lateral offset from the ball for the offer (m)
+
+# Opponent kickoff press: during the kickoff countdown the non-kicking team
+# may move in its own half, so hold press positions just outside the circle
+# on the ball-to-goal line, facing the ball, ready to contest on first touch.
+OPP_KICKOFF_PRESS_DIST_M = 2.0      # Distance from the ball for the first press ring (m)
 
 # M-05 inactivity protection: any robot within BALL_NEAR_RADIUS_M of the ball
 # must show real displacement within INACTIVITY_ALERT_S seconds, otherwise the

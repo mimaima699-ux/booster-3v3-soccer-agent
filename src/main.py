@@ -413,20 +413,64 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         p.walk_to((-circle_r - 0.5, 0.0), avoid_ball=True, avoid_robots=True)
 
 
+def _opp_kickoff_press_target(
+    context: Context,
+    ball,
+    index: int,
+    fallback: list[tuple[float, float]],
+) -> tuple[float, float]:
+    """Press-ready position just outside the circle on the ball-to-goal line.
+
+    The non-kicking team may move inside its own half during the kickoff
+    countdown, so instead of freezing at ready slots the players hold a
+    press shape facing the ball. Targets stay outside the center circle and
+    inside our half to respect kickoff positioning rules.
+    """
+    if ball is None:
+        return fallback[min(index, len(fallback) - 1)]
+    gx, gy = own_goal(context)
+    dx, dy = gx - ball.x, gy - ball.y
+    length = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / length, dy / length
+    # First ring on the line, second ring deeper on the opposite flank.
+    reach = OPP_KICKOFF_PRESS_DIST_M + (0.0 if index == 0 else 0.6)
+    lateral = -0.9 if index == 0 else 0.9
+    tx = ball.x + ux * reach - uy * lateral
+    ty = ball.y + uy * reach + ux * lateral
+    tx, ty = clamp_inside_field(context, tx, ty, margin=0.3)
+    # Legality: outside the center circle and strictly inside our half.
+    tx = min(tx, -CIRCLE_MARGIN_M)
+    tx = max(tx, -context.field.length / 2.0 + 0.3)
+    return (tx, ty)
+
+
 def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
-    """Guard with one player while the others wait outside the center circle."""
+    """Guard with one player while the others hold press-ready positions.
+
+    Instead of standing still at fixed ready slots during the opponent's
+    approach, the two field players keep a press shape just outside the
+    center circle on the ball-to-goal line, facing the ball, ready to
+    contest the moment ball ownership opens.
+    """
     if not players:
         return
     gx, gy = own_goal(context)
     guard = min(players, key=lambda p: _player_dist_to_position(p, (gx, gy)))
     guard.guard()
 
+    ball = context.ball
     rest = [p for p in players if p is not guard]
     r = context.field.circle_radius
-    slots = [(-r - 0.5, 0.0), (-r - 2.0, 0.5)]
-    for p, target in zip(rest, slots):
-        p.action = "opp_kickoff:ready"
-        p.walk_to(target, avoid_ball=True, avoid_robots=True)
+    fallback = [(-r - 0.5, 0.0), (-r - 2.0, 0.5)]
+    for index, p in enumerate(rest):
+        p.action = "opp_kickoff:press"
+        target = _opp_kickoff_press_target(context, ball, index, fallback)
+        face = (
+            angle_to(p.pose.x, p.pose.y, ball.x, ball.y)
+            if ball is not None and p.pose is not None
+            else None
+        )
+        p.walk_to(target, face=face, avoid_ball=True, avoid_robots=True)
 
 
 def _act_our_set_play(context: Context, players: list[Player], store) -> None:
