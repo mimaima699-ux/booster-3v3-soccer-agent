@@ -155,5 +155,5 @@ old_src/*
 ref/*
 
 
-# Local reference clone of the official soccersim repo (kept out of this strategy repo)
-soccersim/
+# Local dev leftovers inside the imported soccersim tree
+soccersim/.venv/
