@@ -1,0 +1,7 @@
+# 3v3 仿真赛模板文件
+templateKey: soccer-sim
+name: 仿真赛 Agent
+description: 3v3 仿真足球赛agent
+category: 仿真赛
+version: 0.0.5
+min_api_level: 10701

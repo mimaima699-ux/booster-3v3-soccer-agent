@@ -1,0 +1,18 @@
+.vscode/
+build/
+log/
+install/
+pyrightconfig.json
+
+# Python cache/test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.pyright/
+
+# Local debug/generated packages
+artifacts/
+
+# Local simulator/deploy configuration (used only by ros_debug auto-debug scripts)
+ros_debug/.soccer_sim.env

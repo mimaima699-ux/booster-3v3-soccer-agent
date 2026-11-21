@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PACKAGE_NAME="soccer_sim_debug"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HOST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=scripts/soccer_config.sh
+source "$SCRIPT_DIR/soccer_config.sh"
+load_soccer_config "$HOST_ROOT"
+
+CONTAINER="${1:-${SOCCER_DOCKER_CONTAINER:-$SOCCER_DEFAULT_DOCKER_CONTAINER}}"
+WORKDIR="${SOCCER_DOCKER_WORKDIR:-/root/workspace/SoccerSim}"
+ROS_SETUP="${SOCCER_DOCKER_ROS_SETUP:-/opt/ros/humble/setup.bash}"
+EXTRA_SETUP="${SOCCER_DOCKER_EXTRA_SETUP:-}"
+
+docker_tty_args=("-i")
+if [ -t 1 ]; then
+  docker_tty_args=("-it")
+fi
+
+case "$WORKDIR" in
+  "" | "/" | "/root" | "/home" | "/tmp")
+    echo "Refusing unsafe SOCCER_DOCKER_WORKDIR: $WORKDIR" >&2
+    exit 2
+    ;;
+esac
+
+workdir_parent="$(dirname "$WORKDIR")"
+quoted_workdir="$(printf "%q" "$WORKDIR")"
+quoted_parent="$(printf "%q" "$workdir_parent")"
+
+docker exec "${docker_tty_args[@]}" "$CONTAINER" bash -lc \
+  "set -euo pipefail; rm -rf $quoted_workdir; mkdir -p $quoted_workdir $quoted_parent"
+
+deploy_dirs=(
+  "src"
+  "ros_debug"
+  "scripts"
+  "res"
+)
+
+deploy_files=(
+  "AGENTS.md"
+  "agent.toml"
+  "build.toml"
+  "pyrightconfig.json"
+  "template.yaml"
+)
+
+echo "Deploying minimal debug workspace to $CONTAINER:$WORKDIR"
+for deploy_dir in "${deploy_dirs[@]}"; do
+  if [ -d "$HOST_ROOT/$deploy_dir" ]; then
+    docker cp "$HOST_ROOT/$deploy_dir" "$CONTAINER:$WORKDIR/$deploy_dir"
+  fi
+done
+
+for deploy_file in "${deploy_files[@]}"; do
+  if [ -f "$HOST_ROOT/$deploy_file" ]; then
+    docker cp "$HOST_ROOT/$deploy_file" "$CONTAINER:$WORKDIR/$deploy_file"
+  fi
+done
+
+read -r -d '' inner_cmd <<EOF || true
+set -eo pipefail
+cd "$WORKDIR"
+source "$ROS_SETUP"
+if [ -n "$EXTRA_SETUP" ]; then
+  source "$EXTRA_SETUP"
+fi
+python3 -m pip show py_trees >/dev/null 2>&1 || \
+  python3 -m pip install --disable-pip-version-check py_trees==2.4.0
+colcon build --base-paths ros_debug --packages-select "$PACKAGE_NAME"
+EOF
+
+docker exec "${docker_tty_args[@]}" "$CONTAINER" bash -lc "$inner_cmd"

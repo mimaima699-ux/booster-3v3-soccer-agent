@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HOST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=scripts/soccer_config.sh
+source "$SCRIPT_DIR/soccer_config.sh"
+load_soccer_config "$HOST_ROOT"
+
+CONTAINER="${SOCCER_DOCKER_CONTAINER:-$SOCCER_DEFAULT_DOCKER_CONTAINER}"
+WORKDIR="${SOCCER_DOCKER_WORKDIR:-/root/workspace/SoccerSim}"
+ROS_SETUP="${SOCCER_DOCKER_ROS_SETUP:-/opt/ros/humble/setup.bash}"
+EXTRA_SETUP="${SOCCER_DOCKER_EXTRA_SETUP:-}"
+FASTDDS_PROFILE="${SOCCER_FASTDDS_PROFILE:-/opt/booster/BoosterRos2/fastdds_profile.xml}"
+
+DEFAULT_RUN_ID="manual_$(date +%Y%m%d_%H%M%S)"
+RUN_ID="$DEFAULT_RUN_ID"
+CONTROL_HZ="10.0"
+TEAM1_ROBOTS="robot1,robot2,robot3"
+TEAM2_ROBOTS="robot4,robot5,robot6"
+TEAM1_READY_SLOTS="center,side,keeper"
+TEAM2_READY_SLOTS="center,side,keeper"
+BUILD_FIRST=1
+FOLLOW_LOGS=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/manual_match start [options]
+  scripts/manual_match stop
+  scripts/manual_match status
+
+Start deploys/builds current code and launches both strategy nodes.
+It does not start or stop the match in GameControl; use the simulator UI/control for that.
+
+Options for start:
+  --no-build                  Skip scripts/debug_build
+  --run-id ID                 Log run id, default manual_YYYYmmdd_HHMMSS
+  --control-hz HZ             Control loop frequency, default 10.0
+  --team1-robots CSV          Default robot1,robot2,robot3
+  --team2-robots CSV          Default robot4,robot5,robot6
+  --team1-ready-slots CSV     Default center,side,keeper
+  --team2-ready-slots CSV     Default center,side,keeper
+  --follow                    Tail logs after starting
+  -h, --help                  Show this help
+EOF
+}
+
+quote() {
+  printf "%q" "$1"
+}
+
+docker_exec() {
+  docker exec -i "$CONTAINER" bash -lc "$1"
+}
+
+stop_nodes() {
+  docker_exec "python3 - <<'PY'
+import os
+import signal
+import time
+
+pattern = 'manual_match_team'
+own = {os.getpid(), os.getppid()}
+matches = []
+for name in os.listdir('/proc'):
+    if not name.isdigit():
+        continue
+    pid = int(name)
+    if pid in own:
+        continue
+    try:
+        raw = open(f'/proc/{pid}/cmdline', 'rb').read()
+    except OSError:
+        continue
+    cmdline = raw.replace(b'\0', b' ').decode('utf-8', 'replace')
+    if pattern in cmdline and 'soccer_sim_node' in cmdline:
+        matches.append(pid)
+
+for pid in matches:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+time.sleep(1.5)
+
+for pid in matches:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        continue
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+print('stopped manual strategy processes:', ' '.join(str(pid) for pid in matches) or 'none')
+PY"
+}
+
+status_nodes() {
+  docker_exec "ps -eo pid,ppid,stat,cmd | grep -E 'manual_match_team[12]' | grep -v grep || true"
+}
+
+start_team() {
+  local team_id="$1"
+  local robot_names="$2"
+  local opponent_names="$3"
+  local ready_slots="$4"
+  local node_name="manual_match_team${team_id}"
+  local log_dir="$WORKDIR/artifacts/manual_match/$RUN_ID"
+  local log_path="$log_dir/team${team_id}.node.log"
+  local remote_log_dir="/tmp/booster_agent/manual_match/$RUN_ID"
+
+  local quoted_workdir quoted_ros_setup quoted_extra_setup quoted_fastdds_profile
+  local quoted_run_id quoted_remote_log_dir quoted_node_name quoted_team_id
+  local quoted_robot_names quoted_opponent_names quoted_ready_slots quoted_control_hz
+  local quoted_log_dir quoted_log_path
+
+  quoted_workdir="$(quote "$WORKDIR")"
+  quoted_ros_setup="$(quote "$ROS_SETUP")"
+  quoted_extra_setup="$(quote "$EXTRA_SETUP")"
+  quoted_fastdds_profile="$(quote "$FASTDDS_PROFILE")"
+  quoted_run_id="$(quote "$RUN_ID")"
+  quoted_remote_log_dir="$(quote "$remote_log_dir")"
+  quoted_node_name="$(quote "__node:=$node_name")"
+  quoted_team_id="$(quote "team_id:=$team_id")"
+  quoted_robot_names="$(quote "robot_names:=$robot_names")"
+  quoted_opponent_names="$(quote "opponent_robot_names:=$opponent_names")"
+  quoted_ready_slots="$(quote "ready_slots:=$ready_slots")"
+  quoted_control_hz="$(quote "control_hz:=$CONTROL_HZ")"
+  quoted_log_dir="$(quote "$log_dir")"
+  quoted_log_path="$(quote "$log_path")"
+
+  docker_exec "
+set -eo pipefail
+mkdir -p $quoted_log_dir
+cd $quoted_workdir
+source $quoted_ros_setup
+extra_setup=$quoted_extra_setup
+fastdds_profile=$quoted_fastdds_profile
+if [ -n \"\$extra_setup\" ]; then
+  source \"\$extra_setup\"
+fi
+if [ ! -f install/setup.bash ]; then
+  echo 'install/setup.bash not found. Run scripts/manual_match start without --no-build first.' >&2
+  exit 1
+fi
+source install/setup.bash
+if [ -f \"\$fastdds_profile\" ]; then
+  export FASTRTPS_DEFAULT_PROFILES_FILE=\"\${FASTRTPS_DEFAULT_PROFILES_FILE:-\$fastdds_profile}\"
+fi
+export SOCCER_RUN_ID=$quoted_run_id
+export SOCCER_LOG_DIR=$quoted_remote_log_dir
+export SOCCER_PRETTY_LOG=off
+export SOCCER_TELEMETRY=jsonl
+nohup ros2 run soccer_sim_debug soccer_sim_node \
+  --ros-args \
+  -r $quoted_node_name \
+  -p $quoted_team_id \
+  -p $quoted_robot_names \
+  -p $quoted_opponent_names \
+  -p $quoted_ready_slots \
+  -p $quoted_control_hz \
+  > $quoted_log_path 2>&1 < /dev/null &
+echo \$!
+"
+}
+
+start_match_nodes() {
+  stop_nodes >/dev/null
+
+  if [ "$BUILD_FIRST" -eq 1 ]; then
+    "$SCRIPT_DIR/debug_build" "$CONTAINER"
+  fi
+
+  echo "Starting manual strategy nodes in container $CONTAINER"
+  echo "run_id: $RUN_ID"
+  echo "logs: $WORKDIR/artifacts/manual_match/$RUN_ID"
+
+  local team1_pid team2_pid
+  team1_pid="$(start_team 1 "$TEAM1_ROBOTS" "$TEAM2_ROBOTS" "$TEAM1_READY_SLOTS" | tail -n 1)"
+  team2_pid="$(start_team 2 "$TEAM2_ROBOTS" "$TEAM1_ROBOTS" "$TEAM2_READY_SLOTS" | tail -n 1)"
+
+  echo "team1 pid: $team1_pid"
+  echo "team2 pid: $team2_pid"
+  echo
+  echo "Strategy nodes are running. Start/end the match manually in GameControl."
+
+  if [ "$FOLLOW_LOGS" -eq 1 ]; then
+    docker_exec "cd $(quote "$WORKDIR") && tail -F artifacts/manual_match/$(quote "$RUN_ID")/team1.node.log artifacts/manual_match/$(quote "$RUN_ID")/team2.node.log"
+  fi
+}
+
+parse_start_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --no-build)
+        BUILD_FIRST=0
+        shift
+        ;;
+      --run-id)
+        RUN_ID="${2:?missing value for --run-id}"
+        shift 2
+        ;;
+      --control-hz)
+        CONTROL_HZ="${2:?missing value for --control-hz}"
+        shift 2
+        ;;
+      --team1-robots)
+        TEAM1_ROBOTS="${2:?missing value for --team1-robots}"
+        shift 2
+        ;;
+      --team2-robots)
+        TEAM2_ROBOTS="${2:?missing value for --team2-robots}"
+        shift 2
+        ;;
+      --team1-ready-slots)
+        TEAM1_READY_SLOTS="${2:?missing value for --team1-ready-slots}"
+        shift 2
+        ;;
+      --team2-ready-slots)
+        TEAM2_READY_SLOTS="${2:?missing value for --team2-ready-slots}"
+        shift 2
+        ;;
+      --follow)
+        FOLLOW_LOGS=1
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown start option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+}
+
+main() {
+  local command="${1:-}"
+  if [ -z "$command" ]; then
+    usage >&2
+    exit 2
+  fi
+  shift || true
+
+  case "$command" in
+    start)
+      parse_start_args "$@"
+      start_match_nodes
+      ;;
+    stop)
+      stop_nodes
+      ;;
+    status)
+      status_nodes
+      ;;
+    -h | --help)
+      usage
+      ;;
+    *)
+      echo "Unknown command: $command" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
