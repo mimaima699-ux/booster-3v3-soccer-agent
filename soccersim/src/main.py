@@ -12,6 +12,10 @@ import threading
 
 from booster_agent_framework import AgentBase, AgentFeatures
 
+# Keep in sync with agent.toml `version`; logged at startup so the running
+# build can be identified from Studio agent logs.
+AGENT_VERSION = "1.3.0"
+
 from .runtime import SoccerTeamRuntime
 from .soccer_framework import SoccerConfig
 from .soccer_framework.telemetry import SoccerLogger, create_soccer_logger
@@ -35,9 +39,10 @@ class SoccerSimAgent(AgentBase):
             config=self.config,
         )
         self.soccer_logger.info(
-            "SoccerSimAgent initialized",
+            f"SoccerSimAgent v{AGENT_VERSION} initialized",
             event="agent_initialized",
             console=False,
+            version=AGENT_VERSION,
             team_id=self.config.team_id,
             robot_names=list(self.config.robot_names),
             control_hz=self.config.control_hz,
