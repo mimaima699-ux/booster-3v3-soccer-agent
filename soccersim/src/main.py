@@ -14,7 +14,7 @@ from booster_agent_framework import AgentBase, AgentFeatures
 
 # Keep in sync with agent.toml `version`; logged at startup so the running
 # build can be identified from Studio agent logs.
-AGENT_VERSION = "1.4.1"
+AGENT_VERSION = "1.4.2"
 
 from .runtime import SoccerTeamRuntime
 from .soccer_framework import SoccerConfig

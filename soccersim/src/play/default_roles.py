@@ -388,6 +388,7 @@ class GoalkeeperRole(RoleStrategy):
             decision = KeeperDecision(
                 KEEPER_MODE_POSITION,
                 0.0,
+                0.0,
                 False,
                 reason="waiting for pose",
             )
@@ -429,15 +430,10 @@ class GoalkeeperRole(RoleStrategy):
                 kick_theta,
                 self._CHALLENGE_APPROACH_OFFSET,
             )
-        keeper_x = (
-            -kit.config.field_length / 2.0
-            + kit.config.strategy.keeper_zone_min_x_offset_m
-        )
-        y = decision.lateral_y
         return Pose2D(
-            keeper_x,
-            y,
-            kit.field.face_ball_theta(keeper_x, y, ball),
+            decision.guard_x,
+            decision.lateral_y,
+            kit.field.face_ball_theta(decision.guard_x, decision.lateral_y, ball),
         )
 
     def wants_to_kick(

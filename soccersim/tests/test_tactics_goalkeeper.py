@@ -78,6 +78,28 @@ class KeeperModeTests(unittest.TestCase):
         self.assertEqual(decision.mode, KEEPER_MODE_POSITION)
         self.assertFalse(decision.wants_clear)
 
+    def test_guard_point_dynamic_depth(self) -> None:
+        # Simple-framework geometry: the guard point sits at
+        # keeper_intercept_fraction along the ball-to-goal-center line,
+        # clamped to the [min, max] depth band.
+        strategy = self.config.strategy
+        goal_x = -self.config.field_length / 2.0
+        # Ball at (-1, 2): raw point = goal + 0.4 * (ball - goal),
+        # inside the band -> unclamped fraction value.
+        decision = self._step(-1.0, y=2.0)
+        self.assertAlmostEqual(
+            decision.guard_x, goal_x + 6.0 * strategy.keeper_intercept_fraction, places=6,
+        )
+        self.assertAlmostEqual(
+            decision.lateral_y, 2.0 * strategy.keeper_intercept_fraction, places=6,
+        )
+        # Ball near the goal but outside the challenge radius: raw depth
+        # below min -> clamped to the shallowest allowed depth.
+        decision = self._step(-4.5, y=2.0, t=1.1)  # ~3.2 m from goal center
+        min_x = goal_x + strategy.keeper_zone_min_x_offset_m
+        self.assertEqual(decision.mode, KEEPER_MODE_INTERCEPT)
+        self.assertAlmostEqual(decision.guard_x, min_x, places=6)
+
     def test_medium_ball_is_intercept(self) -> None:
         decision = self._step(0.0)  # 7 m: POSITION first
         decision = self._step(-3.0)  # ~4.0 m from goal: INTERCEPT

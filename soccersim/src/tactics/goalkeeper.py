@@ -46,13 +46,15 @@ KEEPER_MODE_EMERGENCY = "EMERGENCY"
 class KeeperDecision:
     """One frame's keeper decision.
 
-    ``lateral_y`` is the target y on the keeper line; ``wants_clear`` allows
-    the kick branch; ``challenge`` sends the keeper to attack the ball
-    itself (approach target instead of the guard line); ``reason`` explains
-    the mode for logging.
+    ``guard_x``/``lateral_y`` form the guard target: a point on the
+    ball-to-goal-center line at ``keeper_intercept_fraction`` (dynamic depth
+    — advance when the ball is far, retreat when close), clamped to the
+    keeper zone. ``wants_clear`` allows the kick branch; ``challenge`` sends
+    the keeper to attack the ball itself; ``reason`` explains the mode.
     """
 
     mode: str
+    guard_x: float
     lateral_y: float
     wants_clear: bool
     challenge: bool = False
@@ -95,7 +97,7 @@ class KeeperController:
             max_speed_mps=config.strategy.ball_velocity_max_speed_mps,
         )
         self._mode: str = KEEPER_MODE_POSITION
-        self._last_y: float | None = None
+        self._last_guard: tuple[float, float] | None = None
 
     @property
     def mode(self) -> str:
@@ -104,6 +106,27 @@ class KeeperController:
     def keeper_line_x(self) -> float:
         strategy = self._config.strategy
         return -self._config.field_length / 2.0 + strategy.keeper_zone_min_x_offset_m
+
+    def _guard_point(self, ball: BallState) -> tuple[float, float]:
+        """Dynamic-depth guard point on the ball-to-goal-center line.
+
+        Simple-framework geometry: stand at ``keeper_intercept_fraction``
+        along the line from our goal center toward the ball, so the keeper
+        always covers the shooting line — advancing to compress the angle
+        when the ball is far, retreating when it is close. Depth is clamped
+        to the configured zone band.
+        """
+        strategy = self._config.strategy
+        goal_x = -self._config.field_length / 2.0
+        fraction = strategy.keeper_intercept_fraction
+        x = goal_x + (ball.x - goal_x) * fraction
+        y = ball.y * fraction
+        x = max(
+            goal_x + strategy.keeper_zone_min_x_offset_m,
+            min(goal_x + strategy.keeper_zone_max_x_offset_m, x),
+        )
+        half_width = strategy.keeper_zone_half_width_m
+        return x, max(-half_width, min(half_width, y))
 
     def update(
         self,
@@ -124,9 +147,12 @@ class KeeperController:
         if self._mode == KEEPER_MODE_CHALLENGE:
             # Sweeper-keeper: go win the ball and clear it. The kick branch
             # is always wanted; the attack subtree gates it by kick range.
-            y = crossing_y if self._last_y is None else self._last_y
+            x, y = self._guard_point(ball)
+            if self._last_guard is not None:
+                x, y = self._last_guard
             return KeeperDecision(
                 self._mode,
+                x,
                 y,
                 wants_clear=True,
                 challenge=True,
@@ -134,9 +160,10 @@ class KeeperController:
             )
 
         if self._mode == KEEPER_MODE_EMERGENCY:
-            # Fast shot: block the predicted crossing point; bypass the
-            # deadband so the reaction is immediate. Clear only when the
-            # ball is already at the keeper's feet.
+            # Fast shot: block the predicted crossing point on the keeper
+            # line; bypass the deadband so the reaction is immediate. Clear
+            # only when the ball is already at the keeper's feet.
+            x = keeper_x
             y = crossing_y
             wants_clear = (
                 math.hypot(ball.x - keeper_pose.x, ball.y - keeper_pose.y)
@@ -144,7 +171,9 @@ class KeeperController:
             )
             reason = "fast shot; block crossing point"
         else:
-            y = crossing_y
+            # POSITION / INTERCEPT: dynamic-depth guard point on the
+            # ball-to-goal line (the simple-framework geometry).
+            x, y = self._guard_point(ball)
             wants_clear = False
             reason = (
                 "ball in defensive vicinity"
@@ -155,13 +184,15 @@ class KeeperController:
         half_width = strategy.keeper_zone_half_width_m
         y = max(-half_width, min(half_width, y))
 
-        if self._mode != KEEPER_MODE_EMERGENCY and self._last_y is not None:
-            if abs(y - self._last_y) <= strategy.keeper_track_deadband_m:
-                y = self._last_y
-        self._last_y = y
+        if self._mode != KEEPER_MODE_EMERGENCY and self._last_guard is not None:
+            last_x, last_y = self._last_guard
+            if math.hypot(x - last_x, y - last_y) <= strategy.keeper_track_deadband_m:
+                x, y = last_x, last_y
+        self._last_guard = (x, y)
 
         return KeeperDecision(
             mode=self._mode,
+            guard_x=x,
             lateral_y=y,
             wants_clear=wants_clear,
             reason=reason,

@@ -147,8 +147,14 @@ class SoccerStrategyTuning:
 
     # Goalkeeper zone and behavior. The keeper never leaves this box except to
     # clear a ball inside its challenge radius, and never crosses halfway.
-    keeper_zone_min_x_offset_m: float = 1.1  #  Keeper line minimum distance from our goal line (m).
-    keeper_zone_max_x_offset_m: float = 1.6  #  Deepest the keeper may advance for a clear (m).
+    # Guard depth is dynamic: the keeper stands at ``keeper_intercept_fraction``
+    # along the ball-to-goal-center line (ball far -> advance and compress the
+    # angle, ball close -> retreat toward the line), clamped to the band
+    # [min, max] offsets from our goal line. This is the proven simple-framework
+    # goalkeeper geometry.
+    keeper_intercept_fraction: float = 0.4  #  Position along the ball-to-goal line (0 = goal, 1 = ball).
+    keeper_zone_min_x_offset_m: float = 1.1  #  Shallowest guard depth from our goal line (m).
+    keeper_zone_max_x_offset_m: float = 2.5  #  Deepest guard depth from our goal line (m).
     keeper_zone_half_width_m: float = 1.6  #  Lateral clamp of the keeper zone (m).
     keeper_track_deadband_m: float = 0.15  #  Ignore smaller guard-target corrections (m).
     keeper_challenge_radius_m: float = 1.7  #  Ball within this of the guard target may be cleared (m).
