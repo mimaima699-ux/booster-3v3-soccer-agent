@@ -94,9 +94,29 @@ class ReadyStance:
         self,
         ball: BallState | None,
     ) -> Pose2D:
-        """Goalkeeper guard formula; the default goalkeeper role calls this."""
-        keeper_x = self.field.own_goal_x() + self.config.goal_area_length + 0.50
-        keeper_y = clamp((ball.y * 0.38) if ball else 0.0, -1.35, 1.35)
+        """Goalkeeper guard target covering the most dangerous shooting angle.
+
+        The keeper line sits at ``keeper_zone_min_x_offset_m`` from our goal
+        line and the lateral position is where the ball-to-goal-center line
+        crosses it, so the keeper always blocks the direct shooting lane
+        instead of merely echoing a fraction of the ball's y. The result is
+        clamped to the configured keeper zone.
+        """
+        strategy = self.config.strategy
+        own_goal_x = self.field.own_goal_x()
+        keeper_x = own_goal_x + strategy.keeper_zone_min_x_offset_m
+        half_width = strategy.keeper_zone_half_width_m
+
+        keeper_y = 0.0
+        if ball is not None:
+            if ball.x > keeper_x + 0.2:
+                # Crossing of the ball -> goal-center line at the keeper line.
+                t = (keeper_x - own_goal_x) / (ball.x - own_goal_x)
+                keeper_y = ball.y * t
+            else:
+                # Ball level with or behind the keeper: shade toward its y.
+                keeper_y = ball.y * 0.5
+        keeper_y = clamp(keeper_y, -half_width, half_width)
         return Pose2D(
             keeper_x,
             keeper_y,

@@ -173,6 +173,15 @@ class Targeting:
     def kick_power_for_distance(self, distance_m: float) -> float:
         return attack.kick_power_for_distance(self.config, distance_m)
 
+    def kick_is_own_goal_safe(
+        self,
+        ball: BallState,
+        kick_direction: float,
+    ) -> bool:
+        return attack.kick_is_own_goal_safe(
+            self.config, self.field, ball, kick_direction,
+        )
+
     def lane_clear_score(
         self,
         start_x: float,
@@ -204,6 +213,28 @@ class Targeting:
         is_player_allowed: PlayerAllowed,
     ) -> Pose2D:
         return support.support_target(
+            self.config, self.field, player_id, context,
+            is_player_allowed,
+        )
+
+    def attack_support_target(
+        self,
+        player_id: int,
+        context: PlayContext,
+        is_player_allowed: PlayerAllowed,
+    ) -> Pose2D:
+        return support.attack_support_target(
+            self.config, self.field, player_id, context,
+            is_player_allowed,
+        )
+
+    def defender_cover_target(
+        self,
+        player_id: int,
+        context: PlayContext,
+        is_player_allowed: PlayerAllowed,
+    ) -> Pose2D:
+        return support.defender_cover_target(
             self.config, self.field, player_id, context,
             is_player_allowed,
         )

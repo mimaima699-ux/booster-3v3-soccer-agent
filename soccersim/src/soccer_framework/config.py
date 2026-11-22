@@ -133,11 +133,46 @@ class SoccerStrategyTuning:
         0.15  #  Tie band for teammate ball-claim distances to prevent oscillating handoff.
     )
 
-    # All-out press
-    # When trailing late in the match, the goalkeeper joins the attack as a
-    # supporter. Reads only GameController score and clock, never local timers.
+    # All-out press (disabled by default: the dedicated-keeper strategy keeps
+    # the goalkeeper permanently defensive; enable explicitly to trade an
+    # empty goal for an equalizer when losing late).
+    press_enabled: bool = False  #  Master switch for the losing-scoreline press.
     press_min_goal_deficit: int = 1  #  Minimum goals behind that may trigger the press.
     press_when_losing_after_sec: int = 180  #  Press only when remaining seconds are at or below this.
+
+    # Team attack/defense mode hysteresis. Separate enter/exit thresholds keep
+    # the mode stable while the ball moves back and forth across halfway.
+    defense_enter_ball_x: float = -0.5  #  Ball below this x switches to DEFENSE (m).
+    defense_exit_ball_x: float = 0.5  #  Ball above this x returns to ATTACK (m).
+
+    # Goalkeeper zone and behavior. The keeper never leaves this box except to
+    # clear a ball inside its challenge radius, and never crosses halfway.
+    keeper_zone_min_x_offset_m: float = 1.1  #  Keeper line minimum distance from our goal line (m).
+    keeper_zone_max_x_offset_m: float = 1.6  #  Deepest the keeper may advance for a clear (m).
+    keeper_zone_half_width_m: float = 1.6  #  Lateral clamp of the keeper zone (m).
+    keeper_track_deadband_m: float = 0.15  #  Ignore smaller guard-target corrections (m).
+    keeper_challenge_radius_m: float = 1.7  #  Ball within this of the guard target may be cleared (m).
+
+    # Own-goal safety: reject kicks whose line from the ball would enter this
+    # half-width band at our goal line.
+    own_goal_guard_half_width_m: float = 1.8  #  Guarded band half-width at our goal line (m).
+
+    # Defensive cover for the secondary defender: goal-side of the ball on the
+    # ball-to-goal line, offset off the pressure lane, held in a central band.
+    defender_cover_depth_m: float = 1.8  #  Cover point distance goal-side of the ball (m).
+    defender_cover_lateral_m: float = 1.0  #  Lateral offset away from the pressure lane (m).
+    defender_center_half_width_m: float = 1.5  #  Central band the cover must stay within (m).
+
+    # Attacking support offer: ahead-lateral of the ball so passes can exist.
+    attack_support_ahead_m: float = 1.8  #  How far ahead of the ball the offer stands (m).
+    attack_support_lateral_m: float = 1.4  #  Lateral offset from the ball (m).
+
+    # Recovery: back off briefly when the chaser makes no progress near the
+    # ball, instead of standing still into an incapable-robot penalty.
+    recovery_stuck_sec: float = 6.0  #  Near-ball time with no meaningful displacement before backoff (s).
+    recovery_stuck_displacement_m: float = 0.5  #  Displacement that counts as progress (m).
+    recovery_backoff_sec: float = 2.5  #  Backoff window duration (s).
+    recovery_cooldown_sec: float = 4.0  #  Cooldown before stuck detection re-arms (s).
 
     # Passing
     pass_enabled: bool = True  #  Master pass switch.

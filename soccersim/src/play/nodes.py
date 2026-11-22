@@ -240,6 +240,18 @@ class KickAction(py_trees.behaviour.Behaviour):
         kick_distance = math.hypot(kt.x - ball.x, kt.y - ball.y)
         kit = self._kit
         player_id = self._player_id
+        if not kit.targeting.kick_is_own_goal_safe(ball, kick_theta):
+            # Reject the kick; the parent Selector falls back to MoveToTarget
+            # so the robot repositions instead of pushing the ball goalward.
+            logger = kit.logger()
+            if logger is not None:
+                logger.info(
+                    f"p{player_id} own-goal guard rejected kick",
+                    event="own_goal_guard",
+                    console=False,
+                    player=player_id,
+                )
+            return py_trees.common.Status.FAILURE
         reason = (
             self._reason_fn(kt)
             if self._reason_fn is not None

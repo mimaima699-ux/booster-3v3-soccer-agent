@@ -109,6 +109,9 @@ class SoccerKit:
     """
 
     def __init__(self, config: SoccerConfig):
+        # Team tactical mode set by the Playbook each tick ("ATTACK"/"DEFENSE");
+        # roles read it to choose attacking or defensive target variants.
+        self.team_mode: str = "ATTACK"
         self.config = config
         self.field = TeamFieldFrame(config)
         self.obstacles = ObstacleCollector(config, self.field)

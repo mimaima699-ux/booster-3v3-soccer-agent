@@ -35,6 +35,7 @@ __all__ = [
     "best_shot_target",
     "dribble_target",
     "kick_power_for_distance",
+    "kick_is_own_goal_safe",
     "kick_reason",
     "lane_clear_score",
     "select_clear_or_pass_target",
@@ -305,6 +306,32 @@ def kick_power_for_distance(config: SoccerConfig, distance_m: float) -> float:
         0.0, distance_m,
     )
     return min(strategy.kick_power_max, max(strategy.kick_power_min, power))
+
+
+def kick_is_own_goal_safe(
+    config: SoccerConfig,
+    field: TeamFieldFrame,
+    ball: BallState,
+    kick_direction: float,
+) -> bool:
+    """Whether a straight kick in ``kick_direction`` cannot enter our own goal.
+
+    Unsafe only when the line from the ball travels toward our goal line and
+    crosses it inside the guarded mouth band
+    (``own_goal_guard_half_width_m``). Forward or lateral-forward kicks are
+    always safe. The kick executor rejects unsafe directions so the robot
+    repositions instead of pushing the ball toward its own net.
+    """
+
+    dx = math.cos(kick_direction)
+    if dx >= -1e-6:
+        return True  # Not traveling toward our goal line.
+    goal_x = field.own_goal_x()
+    if ball.x <= goal_x + 0.05:
+        return True  # Level with or behind the line; nothing left to guard.
+    t = (goal_x - ball.x) / dx
+    y_at_goal = ball.y + math.sin(kick_direction) * t
+    return abs(y_at_goal) > config.strategy.own_goal_guard_half_width_m
 
 
 # Dribble and reason text

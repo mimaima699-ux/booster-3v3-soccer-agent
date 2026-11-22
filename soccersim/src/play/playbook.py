@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 ROLE_CHASER = "chaser"
 ROLE_SUPPORTER = "supporter"
 ROLE_GOALKEEPER = "goalkeeper"
+ROLE_DEFENDER = "defender"
 ROLE_NONE = "none"
 
 
