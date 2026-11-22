@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import cast
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -277,6 +278,15 @@ import src.soccer_framework.ros_adapter as ros_adapter_module  # noqa: E402
 from src.soccer_framework.robot import TeamRobotManager  # noqa: E402
 from src.soccer_framework.ros_truth import RosTruthProvider  # noqa: E402
 
+# Imported after the runtime dependency fakes are installed: at runtime this
+# resolves to the stub Node (plain object); for static analysis it is the real
+# rclpy Node used to type the test-double boundary below.
+from rclpy.node import Node  # noqa: E402
+
+# FakeNode implements exactly the subscription surface the ROS providers use
+# (create_subscription / destroy_subscription); the casts below document that
+# validated boundary instead of weakening the production signatures.
+
 ros_adapter_module.rclpy = sys.modules["rclpy"]
 ros_adapter_module.ExternalShutdownException = FakeExternalShutdownException
 ros_adapter_module.SingleThreadedExecutor = FakeSingleThreadedExecutor
@@ -431,7 +441,7 @@ class SoccerRuntimeTests(unittest.TestCase):
         node = FakeNode()
         logger = FakeLogger()
         provider = RosTruthProvider(
-            node=node,
+            node=cast(Node, node),
             config=SoccerConfig(
                 team_id=2,
                 robot_names=("robot4", "robot5"),
@@ -503,7 +513,7 @@ class SoccerRuntimeTests(unittest.TestCase):
     ) -> None:
         states: list[GameControlState] = []
         provider = GameControllerRosProvider(
-            node=FakeNode(),
+            node=cast(Node, FakeNode()),
             config=SoccerConfig(),
             logger=FakeLogger(),
             on_state=states.append,
