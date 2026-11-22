@@ -26,6 +26,7 @@ from ..soccer_framework import BallState, Pose2D, SoccerConfig
 
 
 __all__ = [
+    "KEEPER_MODE_CHALLENGE",
     "KEEPER_MODE_EMERGENCY",
     "KEEPER_MODE_INTERCEPT",
     "KEEPER_MODE_POSITION",
@@ -37,6 +38,7 @@ __all__ = [
 
 KEEPER_MODE_POSITION = "POSITION"
 KEEPER_MODE_INTERCEPT = "INTERCEPT"
+KEEPER_MODE_CHALLENGE = "CHALLENGE"
 KEEPER_MODE_EMERGENCY = "EMERGENCY"
 
 
@@ -44,14 +46,17 @@ KEEPER_MODE_EMERGENCY = "EMERGENCY"
 class KeeperDecision:
     """One frame's keeper decision.
 
-    ``lateral_y`` is the target y on the keeper line; ``wants_clear`` allows a
-    close-range clear kick; ``reason`` explains the mode for logging.
+    ``lateral_y`` is the target y on the keeper line; ``wants_clear`` allows
+    the kick branch; ``challenge`` sends the keeper to attack the ball
+    itself (approach target instead of the guard line); ``reason`` explains
+    the mode for logging.
     """
 
     mode: str
     lateral_y: float
     wants_clear: bool
-    reason: str
+    challenge: bool = False
+    reason: str = ""
 
 
 class BallVelocityTracker:
@@ -112,21 +117,32 @@ class KeeperController:
         ball_to_goal = math.hypot(ball.x - goal_x, ball.y)
         velocity = self._velocity.update(ball, now)
         crossing_y = self._predicted_crossing_y(ball, velocity, keeper_x)
+        fast_threat = self._fast_threat(velocity, crossing_y)
 
-        self._update_mode(ball_to_goal, crossing_y)
+        self._update_mode(ball_to_goal, fast_threat)
+
+        if self._mode == KEEPER_MODE_CHALLENGE:
+            # Sweeper-keeper: go win the ball and clear it. The kick branch
+            # is always wanted; the attack subtree gates it by kick range.
+            y = crossing_y if self._last_y is None else self._last_y
+            return KeeperDecision(
+                self._mode,
+                y,
+                wants_clear=True,
+                challenge=True,
+                reason="slow ball in challenge zone; attack and clear",
+            )
 
         if self._mode == KEEPER_MODE_EMERGENCY:
-            # Bypass the deadband: react immediately to the threat.
+            # Fast shot: block the predicted crossing point; bypass the
+            # deadband so the reaction is immediate. Clear only when the
+            # ball is already at the keeper's feet.
             y = crossing_y
             wants_clear = (
                 math.hypot(ball.x - keeper_pose.x, ball.y - keeper_pose.y)
                 <= strategy.keeper_clear_range_m
             )
-            reason = (
-                "ball closing on goal"
-                if self._velocity_closes_on_goal(velocity)
-                else "ball in emergency radius"
-            )
+            reason = "fast shot; block crossing point"
         else:
             y = crossing_y
             wants_clear = False
@@ -153,30 +169,58 @@ class KeeperController:
 
     # -- internals ------------------------------------------------------
 
-    def _update_mode(self, ball_to_goal: float, crossing_y: float | None) -> None:
+    def _update_mode(self, ball_to_goal: float, fast_threat: bool) -> None:
         strategy = self._config.strategy
-        threat_crossing = (
-            crossing_y is not None
-            and abs(crossing_y) <= self._config.goal_width / 2.0 + 0.3
-        )
 
-        if self._mode == KEEPER_MODE_EMERGENCY:
-            if ball_to_goal > strategy.keeper_emergency_exit_radius_m:
+        if self._mode == KEEPER_MODE_CHALLENGE:
+            if fast_threat and ball_to_goal < strategy.keeper_intercept_enter_radius_m:
+                self._mode = KEEPER_MODE_EMERGENCY
+            elif ball_to_goal > strategy.keeper_challenge_exit_radius_m:
                 self._mode = (
                     KEEPER_MODE_INTERCEPT
                     if ball_to_goal < strategy.keeper_intercept_exit_radius_m
                     else KEEPER_MODE_POSITION
                 )
+        elif self._mode == KEEPER_MODE_EMERGENCY:
+            if not fast_threat and ball_to_goal > strategy.keeper_emergency_exit_radius_m:
+                if ball_to_goal < strategy.keeper_challenge_exit_radius_m:
+                    self._mode = KEEPER_MODE_CHALLENGE
+                elif ball_to_goal < strategy.keeper_intercept_exit_radius_m:
+                    self._mode = KEEPER_MODE_INTERCEPT
+                else:
+                    self._mode = KEEPER_MODE_POSITION
+            elif ball_to_goal > strategy.keeper_intercept_exit_radius_m:
+                self._mode = KEEPER_MODE_POSITION
         elif self._mode == KEEPER_MODE_INTERCEPT:
-            if threat_crossing and ball_to_goal < strategy.keeper_emergency_exit_radius_m:
+            if fast_threat and ball_to_goal < strategy.keeper_intercept_enter_radius_m:
                 self._mode = KEEPER_MODE_EMERGENCY
+            elif not fast_threat and ball_to_goal < strategy.keeper_challenge_enter_radius_m:
+                self._mode = KEEPER_MODE_CHALLENGE
             elif ball_to_goal >= strategy.keeper_intercept_exit_radius_m:
                 self._mode = KEEPER_MODE_POSITION
         else:  # POSITION
-            if threat_crossing and ball_to_goal < strategy.keeper_emergency_radius_m:
+            if fast_threat and ball_to_goal < strategy.keeper_intercept_enter_radius_m:
                 self._mode = KEEPER_MODE_EMERGENCY
+            elif not fast_threat and ball_to_goal < strategy.keeper_challenge_enter_radius_m:
+                self._mode = KEEPER_MODE_CHALLENGE
             elif ball_to_goal < strategy.keeper_intercept_enter_radius_m:
                 self._mode = KEEPER_MODE_INTERCEPT
+
+    def _fast_threat(
+        self,
+        velocity: tuple[float, float] | None,
+        crossing_y: float,
+    ) -> bool:
+        """A fast ball closing on our goal with a crossing inside the mouth band.
+
+        Slow dribbles never count: those are challenge opportunities, and the
+        keeper should win the ball instead of retreating to its line.
+        """
+        if velocity is None:
+            return False
+        if velocity[0] > -self._config.strategy.ball_fast_closing_mps:
+            return False
+        return abs(crossing_y) <= self._config.goal_width / 2.0 + 0.3
 
     def _velocity_closes_on_goal(self, velocity: tuple[float, float] | None) -> bool:
         if velocity is None:

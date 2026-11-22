@@ -25,6 +25,7 @@ from src.soccer_framework import (  # noqa: E402
 from src.soccer_framework.types import StopIntent  # noqa: E402
 from src.tactics.geometry import TeamFieldFrame  # noqa: E402
 from src.tactics.goalkeeper import (  # noqa: E402
+    KEEPER_MODE_CHALLENGE,
     KEEPER_MODE_EMERGENCY,
     KEEPER_MODE_INTERCEPT,
     KEEPER_MODE_POSITION,
@@ -78,35 +79,57 @@ class KeeperModeTests(unittest.TestCase):
         self.assertFalse(decision.wants_clear)
 
     def test_medium_ball_is_intercept(self) -> None:
-        decision = self._step(-2.0)  # ~5.4 m from goal center... closer below
         decision = self._step(0.0)  # 7 m: POSITION first
-        decision = self._step(-3.0)  # ~4.0 m: INTERCEPT
+        decision = self._step(-3.0)  # ~4.0 m from goal: INTERCEPT
         self.assertEqual(decision.mode, KEEPER_MODE_INTERCEPT)
 
-    def test_close_ball_is_emergency_with_hysteresis(self) -> None:
-        self._step(0.0)  # POSITION
-        decision = self._step(-5.5)  # 1.5 m from goal: EMERGENCY
-        self.assertEqual(decision.mode, KEEPER_MODE_EMERGENCY)
-        # 2.2 m: inside the 2.8 m exit radius, must stay EMERGENCY.
-        decision = self._step(-4.8, t=1.1)
-        self.assertEqual(decision.mode, KEEPER_MODE_EMERGENCY)
-        # 3.0 m: beyond the exit radius, leaves into INTERCEPT (inside 5.2 m).
-        decision = self._step(-4.0, t=1.2)
+    def test_close_slow_ball_challenges(self) -> None:
+        self._step(0.0, t=1.0)  # POSITION
+        # Ball 2.0 m from goal, appearing without a usable velocity estimate
+        # (the teleport-speed pair is rejected by the sanity clamp).
+        decision = self._step(-5.0, t=1.1)
+        self.assertEqual(decision.mode, KEEPER_MODE_CHALLENGE)
+        self.assertTrue(decision.challenge)
+        self.assertTrue(decision.wants_clear)
+
+    def test_challenge_hysteresis(self) -> None:
+        self._step(0.0, t=1.0)
+        self._step(-5.0, t=1.1)  # 2.0 m: CHALLENGE
+        decision = self._step(-4.4, t=1.2)  # 2.6 m: inside 3.6 exit
+        self.assertEqual(decision.mode, KEEPER_MODE_CHALLENGE)
+        decision = self._step(-3.8, t=1.3)  # 3.2 m: still inside
+        self.assertEqual(decision.mode, KEEPER_MODE_CHALLENGE)
+        decision = self._step(-3.2, t=1.4)  # 3.8 m: exits to INTERCEPT
         self.assertEqual(decision.mode, KEEPER_MODE_INTERCEPT)
+
+    def test_fast_shot_is_emergency_not_challenge(self) -> None:
+        # Prime in INTERCEPT, then a 2 m/s closing shot crossing the mouth.
+        self.controller.update(
+            _ball(-3.0, 0.5, 1.0), _keeper(-5.9, 0.0, 0.0), 1.0,
+        )
+        decision = self.controller.update(
+            _ball(-3.4, 0.5, 1.2),  # vx = -2 m/s toward our goal
+            _keeper(-5.9, 0.0, 0.0),
+            1.2,
+        )
+        self.assertEqual(decision.mode, KEEPER_MODE_EMERGENCY)
+        self.assertFalse(decision.challenge)
+        # Ball 2.5 m from the keeper: block, do not clear yet.
+        self.assertFalse(decision.wants_clear)
 
     def test_emergency_bypasses_deadband(self) -> None:
-        # Establish POSITION with y near 0.
+        # Establish a small guard y, then a fast shot whose crossing is far
+        # from the held value: the deadband must be bypassed.
         self.controller.update(
-            _ball(3.0, 0.1, 1.0), _keeper(-5.9, 0.0, 0.0), 1.0,
+            _ball(-4.0, 0.5, 1.0), _keeper(-5.9, 0.0, 0.0), 1.0,
         )
-        # Emergency ball to the side: y must follow the raw geometric
-        # crossing (teleport-speed velocity estimate is rejected by the
-        # sanity clamp), not the deadband-held previous value.
         decision = self.controller.update(
-            _ball(-5.5, 1.4, 1.2), _keeper(-5.9, 0.0, 0.0), 1.2,
+            _ball(-4.6, 0.5, 1.2),  # vx = -3 m/s, crossing y = 0.5
+            _keeper(-5.9, 0.0, 0.0),
+            1.2,
         )
         self.assertEqual(decision.mode, KEEPER_MODE_EMERGENCY)
-        self.assertAlmostEqual(decision.lateral_y, 1.4 * (1.1 / 1.5), places=5)
+        self.assertAlmostEqual(decision.lateral_y, 0.5, places=5)
 
     def test_velocity_crossing_used_when_closing(self) -> None:
         controller = KeeperController(self.config)
@@ -120,7 +143,7 @@ class KeeperModeTests(unittest.TestCase):
         self.assertEqual(decision.mode, KEEPER_MODE_EMERGENCY)
         # Velocity crossing at the keeper line: t = 1.5/2 = 0.75 s (within the
         # 1.2 s horizon), so y follows the ball line (1.0) instead of the
-        # geometric ball-to-goal-center crossing (1.0 * 1.1/2.6 = 0.42).
+        # geometric ball-to-goal-center crossing (1.0 * 1.1/3.0 = 0.37).
         self.assertAlmostEqual(decision.lateral_y, 1.0, places=5)
 
 

@@ -161,18 +161,20 @@ class SoccerStrategyTuning:
     keeper_strafe_forward_tolerance_m: float = 0.35  #  Forward error above this falls back to walking (m).
     keeper_face_ball_turn_threshold: float = 0.35  #  Heading error that triggers a pure face-ball turn (rad).
 
-    # Goalkeeper mode machine: POSITION / INTERCEPT / EMERGENCY with separate
-    # enter/exit radii (hysteresis) measured from our goal center.
+    # Goalkeeper mode machine: POSITION / INTERCEPT / CHALLENGE / EMERGENCY
+    # with separate enter/exit radii (hysteresis) measured from our goal center.
     keeper_intercept_enter_radius_m: float = 4.5  #  Ball closer than this enters INTERCEPT (m).
     keeper_intercept_exit_radius_m: float = 5.2  #  Ball farther than this returns to POSITION (m).
-    keeper_emergency_radius_m: float = 2.2  #  Ball closer than this enters EMERGENCY (m).
-    keeper_emergency_exit_radius_m: float = 2.8  #  Ball farther than this leaves EMERGENCY (m).
-    keeper_clear_range_m: float = 1.1  #  Ball within this of the keeper may be cleared (m).
+    keeper_challenge_enter_radius_m: float = 3.0  #  Slow ball closer than this: keeper attacks and clears (m).
+    keeper_challenge_exit_radius_m: float = 3.6  #  Ball farther than this ends the challenge (m).
+    keeper_emergency_exit_radius_m: float = 2.8  #  Ball farther than this leaves EMERGENCY once slow (m).
+    keeper_clear_range_m: float = 1.1  #  Ball within this of the keeper may be cleared instantly (m).
 
     # Ball velocity estimation and interception prediction.
     ball_velocity_min_span_sec: float = 0.15  #  Minimum sample pair spacing for a velocity estimate (s).
     ball_velocity_max_age_sec: float = 0.6  #  Older samples are discarded (s).
     ball_velocity_max_speed_mps: float = 6.0  #  Faster estimates are teleport artifacts, not real ball speed (m/s).
+    ball_fast_closing_mps: float = 1.5  #  Closing speed above which the keeper blocks the line instead of challenging (m/s).
     ball_velocity_min_toward_goal_mps: float = 0.4  #  Minimum closing speed counted as a threat (m/s).
     keeper_prediction_horizon_sec: float = 1.2  #  Maximum ball look-ahead for the crossing point (s).
 
