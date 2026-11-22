@@ -158,6 +158,58 @@ class MotionController:
             reason=reason,
         )
 
+    def strafe_command(
+        self,
+        player_id: int,
+        context: PlayContext,
+        target: Pose2D,
+        reason: str,
+    ) -> RobotCommand:
+        """Goalkeeper lateral movement: face ``target.theta``, strafe via vy.
+
+        The biped gait accepts single-axis lateral commands, so the keeper
+        covers its line without the turn-walk-turn cycle that previously
+        dominated its behavior with in-place spinning. Translation is never
+        blocked on orientation: a large heading error triggers one short
+        face-up turn, small errors are corrected later while strafing stops
+        only for that turn. A forward error beyond
+        ``keeper_strafe_forward_tolerance_m`` falls back to normal walking.
+        """
+        robot = context.teammates.get(player_id)
+        if robot is None or robot.pose is None:
+            return RobotCommand.stop(f"{reason}: waiting for pose")
+        pose = robot.pose
+        strategy = self._config.strategy
+
+        theta_error = normalize_angle(target.theta - pose.theta)
+        if abs(theta_error) > strategy.keeper_face_ball_turn_threshold:
+            # One bounded face-up turn; never a rotation loop.
+            return RobotCommand(
+                intent=MoveIntent(vyaw=self._angular_velocity(theta_error)),
+                reason=f"{reason} face",
+            )
+
+        dx = target.x - pose.x
+        dy = target.y - pose.y
+        cos_t = math.cos(pose.theta)
+        sin_t = math.sin(pose.theta)
+        body_x = dx * cos_t + dy * sin_t
+        body_y = -dx * sin_t + dy * cos_t
+
+        if abs(body_x) > strategy.keeper_strafe_forward_tolerance_m:
+            # Depth correction needed: use the normal walking controller.
+            return self.move_to_target(player_id, context, target, reason)
+
+        if abs(body_y) <= strategy.keeper_lateral_arrive_m:
+            return RobotCommand.stop(f"{reason}: lateral arrived")
+
+        vy = clamp(
+            _LINEAR_GAIN * body_y,
+            -strategy.keeper_max_lateral_speed_mps,
+            strategy.keeper_max_lateral_speed_mps,
+        )
+        return RobotCommand(intent=MoveIntent(vy=vy), reason=reason)
+
     def approach_target(
         self,
         ball: BallState,

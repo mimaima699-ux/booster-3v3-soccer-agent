@@ -205,6 +205,53 @@ class MoveToTarget(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
+class StrafeToTarget(py_trees.behaviour.Behaviour):
+    """Goalkeeper movement leaf: lateral strafe toward ``target_fn`` while facing.
+
+    Calls :meth:`MotionController.strafe_command`, which keeps the keeper on
+    its line via single-axis ``vy`` commands instead of the turn-walk-turn
+    cycle. Returns FAILURE when ``target_fn`` raises ``ValueError``.
+    """
+
+    def __init__(
+        self,
+        kit: "SoccerKit",
+        player_id: int,
+        target_fn: TargetFn,
+        *,
+        reason_fn: ReasonFn | None = None,
+    ):
+        super().__init__(f"StrafeToTarget({player_id})")
+        self._kit = kit
+        self._player_id = player_id
+        self._target_fn = target_fn
+        self._reason_fn: ReasonFn = reason_fn or (
+            lambda: _default_move_reason(player_id)
+        )
+        self.blackboard = BlackboardClient(name=self.name)
+
+    def update(self) -> py_trees.common.Status:
+        context = _read_play_context(self.blackboard)
+        if context is None:
+            return py_trees.common.Status.FAILURE
+        try:
+            target = self._target_fn(context)
+        except ValueError:
+            return py_trees.common.Status.FAILURE
+
+        kit = self._kit
+        player_id = self._player_id
+        kit.kicker.clear_player(player_id)
+        command = kit.motion.strafe_command(
+            player_id,
+            context,
+            target,
+            self._reason_fn(),
+        )
+        self.blackboard.write(cmd_key(player_id), command)
+        return py_trees.common.Status.SUCCESS
+
+
 class KickAction(py_trees.behaviour.Behaviour):
     """Call ``kick_target_fn`` each tick to compute the aim point and issue a kick command.
 

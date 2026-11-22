@@ -24,6 +24,7 @@ from .nodes import (
     IsKickWanted,
     KickAction,
     MoveToTarget,
+    StrafeToTarget,
     WaitForBall,
     build_attack_subtree,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "RoleAssignment",
     "RoleRegistry",
     "RoleStrategy",
+    "StrafeToTarget",
     "SupporterRole",
     "TeamPlaybook",
     "WaitForBall",

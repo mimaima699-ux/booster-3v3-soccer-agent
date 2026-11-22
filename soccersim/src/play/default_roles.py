@@ -26,7 +26,19 @@ from typing import TYPE_CHECKING
 import py_trees
 
 from ..soccer_framework import PlayContext, Pose2D, ReadySlot
-from .nodes import AttackSubtreeConfig, MoveToTarget, build_attack_subtree
+from ..tactics.goalkeeper import (
+    KEEPER_MODE_POSITION,
+    KeeperController,
+    KeeperDecision,
+)
+from .nodes import (
+    AttackSubtreeConfig,
+    IsKickWanted,
+    KickAction,
+    MoveToTarget,
+    StrafeToTarget,
+    build_attack_subtree,
+)
 from .role import RoleStrategy
 
 if TYPE_CHECKING:
@@ -330,130 +342,151 @@ class DefenderRole(RoleStrategy):
 
 
 class GoalkeeperRole(RoleStrategy):
-    """Dedicated goalkeeper: zone-locked guard with challenge-radius clears.
+    """Dedicated goalkeeper: strafing interception with a three-mode machine.
 
-    The guard target covers the ball-to-goal-center shooting line inside the
-    keeper zone, with a deadband so noisy ball positions never cause
-    oscillation. Only balls within ``keeper_challenge_radius_m`` of the guard
-    target (and inside the zone's deepest line) may be cleared; when the ball
-    sits in front of the goal mouth the clear goes lateral-forward out of the
-    danger band instead of across the mouth.
+    A :class:`KeeperController` (pure tactics) produces each frame's mode
+    (POSITION / INTERCEPT / EMERGENCY with hysteresis), lateral target, and
+    clear decision. The subtree is intentionally minimal and authoritative:
+
+    - Clear branch: only in EMERGENCY with the ball inside
+      ``keeper_clear_range_m`` of the keeper; the clear goes forward-diagonal
+      out of the mouth band (never across it, never toward our goal).
+    - Strafe branch: ``StrafeToTarget`` holds the keeper line via single-axis
+      lateral commands while facing the ball — no turn-walk-turn cycles, no
+      ``hold_vyaw`` perpetual rotation, and translation is never blocked on
+      orientation alignment.
     """
 
     name = "goalkeeper"
 
-    # Approach alignment distance for goalkeeper challenges (m).
-    _APPROACH_OFFSET = 0.22
-
     def __init__(self) -> None:
         super().__init__()
-        self._last_target: Pose2D | None = None
+        self._controller: KeeperController | None = None
+        self._last_mode: str = KEEPER_MODE_POSITION
+        self._cached: tuple[float, KeeperDecision] | None = None
 
-    def guard_target(
+    def _update(
         self,
         kit: "SoccerKit",
+        player_id: int,
         context: PlayContext,
-    ) -> Pose2D:
-        """Deadband-filtered guard target; small corrections hold the last pose."""
-        raw = kit.ready_stance.goalkeeper_guard_target(context.ball)
-        last = self._last_target
-        if (
-            last is not None
-            and math.hypot(raw.x - last.x, raw.y - last.y)
-            <= kit.config.strategy.keeper_track_deadband_m
-        ):
-            return last
-        self._last_target = raw
-        return raw
+    ) -> KeeperDecision:
+        """Step the keeper controller once per frame (cached per tick)."""
+        ball = context.known_ball
+        now = ball.last_seen_at
+        if self._cached is not None and self._cached[0] == now:
+            return self._cached[1]
+        if self._controller is None:
+            self._controller = KeeperController(kit.config)
+        robot = context.teammates.get(player_id)
+        keeper_pose = robot.pose if robot is not None else None
+        if keeper_pose is None or now <= 0.0:
+            decision = KeeperDecision(
+                KEEPER_MODE_POSITION,
+                0.0,
+                False,
+                "waiting for pose",
+            )
+        else:
+            decision = self._controller.update(ball, keeper_pose, now)
+        self._log_mode_change(kit, decision.mode)
+        self._cached = (now, decision)
+        return decision
+
+    def _log_mode_change(self, kit: "SoccerKit", mode: str) -> None:
+        if mode == self._last_mode:
+            return
+        self._last_mode = mode
+        logger = kit.logger()
+        if logger is not None:
+            logger.info(
+                f"goalkeeper mode -> {mode}",
+                event="keeper_mode",
+                console=False,
+                mode=mode,
+            )
 
     def target(
         self,
         kit: "SoccerKit",
+        player_id: int,
         context: PlayContext,
     ) -> Pose2D:
-        # When a clearable ball is close, target the approach point behind it.
-        # Otherwise return to the deadband-filtered guard target.
-        if self.wants_to_kick(kit, context):
-            ball = context.known_ball
-            kt = self.kick_target(kit, context)
-            kick_theta = math.atan2(kt.y - ball.y, kt.x - ball.x)
-            return kit.motion.approach_target(
-                ball,
-                kick_theta,
-                self._APPROACH_OFFSET,
-            )
-        return self.guard_target(kit, context)
+        decision = self._update(kit, player_id, context)
+        ball = context.known_ball
+        keeper_x = (
+            -kit.config.field_length / 2.0
+            + kit.config.strategy.keeper_zone_min_x_offset_m
+        )
+        y = decision.lateral_y
+        return Pose2D(
+            keeper_x,
+            y,
+            kit.field.face_ball_theta(keeper_x, y, ball),
+        )
 
     def wants_to_kick(
         self,
         kit: "SoccerKit",
+        player_id: int,
         context: PlayContext,
     ) -> bool:
-        ball = context.ball
-        if ball is None:
-            return False
-        strategy = kit.config.strategy
-        guard = kit.ready_stance.goalkeeper_guard_target(ball)
-        if math.hypot(ball.x - guard.x, ball.y - guard.y) > strategy.keeper_challenge_radius_m:
-            return False
-        # Never advance beyond the zone's deepest line.
-        return (
-            ball.x
-            <= kit.field.own_goal_x() + strategy.keeper_zone_max_x_offset_m + 0.3
-        )
+        return self._update(kit, player_id, context).wants_clear
 
     def kick_target(
         self,
         kit: "SoccerKit",
+        player_id: int,
         context: PlayContext,
     ) -> Pose2D:
+        # Emergency clear: forward-diagonal out of the mouth band. The
+        # own-goal guard in KickAction rejects anything unsafe on top of this.
         ball = context.known_ball
-        strategy = kit.config.strategy
-        near_mouth = (
-            abs(ball.y) < kit.config.goal_width / 2.0 + 0.4
-            and ball.x
-            <= kit.field.own_goal_x() + strategy.keeper_zone_max_x_offset_m + 0.8
-        )
-        if near_mouth:
-            # Lateral-forward clear: leave the mouth band, never across it.
-            side = 1.0 if ball.y >= 0.0 else -1.0
-            return Pose2D(
-                0.0,
-                side * (kit.config.field_width / 2.0 - 0.8),
-                0.0,
-            )
-        if kit.targeting.ball_near_sideline(ball):
-            return kit.targeting.sideline_recovery_target(ball)
+        side = 1.0 if ball.y >= 0.0 else -1.0
         return Pose2D(
-            kit.field.opponent_goal_x(),
             0.0,
-            kit.field.attack_theta(),
+            side * (kit.config.field_width / 2.0 - 0.8),
+            0.0,
         )
-
-    def _guard_reason(self) -> str:
-        return "goalkeeper guard"
-
-    def _kick_reason(
-        self,
-        kit: "SoccerKit",
-        target: Pose2D,
-    ) -> str:
-        return kit.targeting.kick_reason(target, default="goalkeeper clear")
 
     def build_subtree(
         self,
         kit: "SoccerKit",
         player_id: int,
     ) -> py_trees.behaviour.Behaviour:
-        return build_attack_subtree(
-            kit,
-            player_id,
-            AttackSubtreeConfig(
-                target_fn=lambda context: self.target(kit, context),
-                kick_target_fn=lambda context: self.kick_target(kit, context),
-                wants_kick_fn=lambda context: self.wants_to_kick(kit, context),
-                reason_fn=self._guard_reason,
-                kick_reason_fn=lambda target: self._kick_reason(kit, target),
-                hold_vyaw=0.12,
-            ),
+        return py_trees.composites.Selector(
+            name=f"Keeper({player_id})",
+            memory=False,
+            children=[
+                py_trees.composites.Sequence(
+                    name=f"KeeperClear({player_id})",
+                    memory=False,
+                    children=[
+                        IsKickWanted(
+                            kit,
+                            player_id,
+                            lambda context: self.wants_to_kick(
+                                kit, player_id, context,
+                            ),
+                        ),
+                        KickAction(
+                            kit,
+                            player_id,
+                            lambda context: self.kick_target(
+                                kit, player_id, context,
+                            ),
+                            reason_fn=lambda target: kit.targeting.kick_reason(
+                                target, default="keeper clear",
+                            ),
+                        ),
+                    ],
+                ),
+                StrafeToTarget(
+                    kit,
+                    player_id,
+                    lambda context: self.target(kit, player_id, context),
+                    reason_fn=lambda: "goalkeeper line",
+                ),
+            ],
         )
+
