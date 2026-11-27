@@ -10,7 +10,7 @@ Sequence(PlayingPhase)
         |-- Selector(Player(1))
         |   |-- Sequence(KickoffHold(1))
         |   |   |-- IsOpponentKickoffActive
-        |   |   `-- GoReadyTarget(1)
+        |   |   `-- DefendOpponentKickoff(1)
         |   |-- Sequence(PenaltyAvoid(1))
         |   |   |-- IsOpponentRestartActive
         |   |   `-- AvoidOpponentRestart(1)
@@ -37,7 +37,7 @@ import py_trees
 from ..soccer_framework import GameState
 from ..behavior_tree.nodes.actions import (
     AvoidOpponentRestart,
-    GoReadyTarget,
+    DefendOpponentKickoff,
 )
 from ..behavior_tree.nodes.conditions import (
     IsGameInState,
@@ -68,7 +68,7 @@ def _create_role_subtree(
         memory=False,
         children=[
             IsOpponentKickoffActive(kit),
-            GoReadyTarget(kit, player_id),
+            DefendOpponentKickoff(kit, player_id),
         ],
     )
     branches.append(kickoff_hold)

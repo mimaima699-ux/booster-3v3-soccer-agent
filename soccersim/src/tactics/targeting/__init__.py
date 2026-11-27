@@ -25,6 +25,8 @@ immediately changes attacking strategy without touching BT structure.
 
 from __future__ import annotations
 
+import math
+
 from ...soccer_framework import (
     BallState,
     GameControlState,
@@ -173,6 +175,18 @@ class Targeting:
     def kick_power_for_distance(self, distance_m: float) -> float:
         return attack.kick_power_for_distance(self.config, distance_m)
 
+    def kick_power_for_target(self, context: PlayContext, target: Pose2D) -> float:
+        ball = context.known_ball
+        strategy = self.config.strategy
+        if (
+            target.x == self.field.opponent_goal_x()
+            and abs(target.y) <= self.config.goal_width / 2.0
+            and not attack.should_make_restart_touch(self.config, context.known_game)
+        ):
+            return strategy.backfield_shot_power if ball.x < 0.0 else strategy.shot_power
+        distance = math.hypot(target.x - ball.x, target.y - ball.y)
+        return self.kick_power_for_distance(distance)
+
     def kick_is_own_goal_safe(
         self,
         ball: BallState,
@@ -230,14 +244,9 @@ class Targeting:
 
     def defender_cover_target(
         self,
-        player_id: int,
         context: PlayContext,
-        is_player_allowed: PlayerAllowed,
     ) -> Pose2D:
-        return support.defender_cover_target(
-            self.config, self.field, player_id, context,
-            is_player_allowed,
-        )
+        return support.defender_cover_target(self.config, self.field, context)
 
     # Restart avoidance
 

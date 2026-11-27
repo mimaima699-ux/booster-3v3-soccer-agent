@@ -79,11 +79,10 @@ class KickHysteresis:
         return False
 
     def mark_kicking(self, player_id: int) -> None:
-        """Explicitly mark ``player_id`` as kicking, used by the KickBall action."""
+        """Mark a kick as active without resetting an ongoing exit delay."""
 
         state = self._state.setdefault(player_id, PlayerKickState())
         state.active = True
-        state.far_since = None
 
     def clear_player(self, player_id: int) -> None:
         """Clear one player's kick state when leaving the ball or becoming penalized."""

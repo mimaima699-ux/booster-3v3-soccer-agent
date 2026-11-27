@@ -21,10 +21,12 @@ import py_trees
 from ...soccer_framework import (
     BallState,
     GameControlState,
+    ReadySlot,
     RobotCommand,
     RobotRuntimeStatus,
     PlayContext,
 )
+from ...tactics.targeting.restart import DEFENDED_RESTARTS
 from ..blackboard import BlackboardKeys, BlackboardClient, cmd_key, robot_status_key
 
 if TYPE_CHECKING:
@@ -138,11 +140,48 @@ class GoReadyTarget(_ActionLeaf):
             self._kit.config.ready_slot_for_player(self._player_id),
             game,
             ball,
+            context.opponents.values(),
         )
         slot = self._kit.config.ready_slot_for_player(self._player_id)
         return self._kit.motion.move_to_target(
             self._player_id, context, target, f"ready {slot.value}",
             avoid_opponents=True,
+        )
+
+
+class DefendOpponentKickoff(_ActionLeaf):
+    """Track the kicker's approach from our side until the referee releases play."""
+
+    def __init__(self, kit: "SoccerKit", player_id: int):
+        super().__init__(f"DefendOpponentKickoff({player_id})", kit, player_id)
+
+    def _compute_command(self) -> RobotCommand | None:
+        context = self._read_context()
+        if context is None:
+            return None
+
+        kit = self._kit
+        player_id = self._player_id
+        slot = kit.config.ready_slot_for_player(player_id)
+        reason = f"defend kickoff {slot.value}"
+        if kit.kicker.is_active(player_id):
+            kit.kicker.clear_player(player_id)
+            return _stop_or_noop_for_status(
+                self.blackboard, player_id, f"{reason}: release kick",
+            )
+
+        target = kit.ready_stance.opponent_kickoff_target(
+            slot, context.ball, context.opponents.values(),
+        )
+        if slot == ReadySlot.KEEPER:
+            return kit.motion.strafe_command(
+                player_id,
+                context,
+                target,
+                reason,
+            )
+        return kit.motion.move_to_target(
+            player_id, context, target, reason, avoid_opponents=True,
         )
 
 
@@ -158,7 +197,12 @@ class AvoidOpponentRestart(_ActionLeaf):
         ball = self._read_ball()
         if context is None or game is None:
             return None
+        was_kicking = self._kit.kicker.is_active(self._player_id)
         self._kit.kicker.clear_player(self._player_id)
+        if was_kicking:
+            return _stop_or_noop_for_status(
+                self.blackboard, self._player_id, "avoid opponent restart: release kick",
+            )
         if ball is None:
             return _stop_or_noop_for_status(
                 self.blackboard,
@@ -179,7 +223,8 @@ class AvoidOpponentRestart(_ActionLeaf):
             robot.pose.x - ball.x,
             robot.pose.y - ball.y,
         )
-        if distance_to_ball >= avoid_distance:
+        active_formation = game.set_play in DEFENDED_RESTARTS
+        if not active_formation and distance_to_ball >= avoid_distance:
             return _stop_or_noop_for_status(
                 self.blackboard,
                 self._player_id,
@@ -193,13 +238,27 @@ class AvoidOpponentRestart(_ActionLeaf):
             context,
             self._kit.ready_stance.base_ready_target,
         )
+        reason = (
+            f"defend {game.set_play.value} {slot.value}"
+            if active_formation else "avoid opponent restart"
+        )
+        if active_formation and slot == ReadySlot.KEEPER:
+            return self._kit.motion.strafe_command(
+                self._player_id,
+                context,
+                target,
+                reason,
+            )
         return self._kit.motion.move_to_target(
             self._player_id,
             context,
             target,
-            "avoid opponent restart",
+            reason,
             arrive_distance=0.25,
-            hold_vyaw=self._kit.targeting.opponent_restart_hold_vyaw(self._player_id, game),
+            hold_vyaw=(
+                0.0 if active_formation
+                else self._kit.targeting.opponent_restart_hold_vyaw(self._player_id, game)
+            ),
             avoid_opponents=True,
         )
 

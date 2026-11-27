@@ -174,60 +174,19 @@ def attack_support_target(
 def defender_cover_target(
     config: SoccerConfig,
     field: TeamFieldFrame,
-    player_id: int,
     context: PlayContext,
-    is_player_allowed: PlayerAllowed,
 ) -> Pose2D:
-    """Secondary-defender cover point during defensive mode.
-
-    The cover sits goal-side of the ball on the ball-to-goal-center line at
-    ``defender_cover_depth_m``, then shifts laterally off the pressure lane
-    (away from the nearest teammate, which is normally the primary defender)
-    so the two field robots never stack on the same spot. The point is held
-    inside a central band so the defensive middle is never abandoned.
-    """
+    """Protect the central lane between the chaser and the goalkeeper."""
     strategy = config.strategy
     ball = context.known_ball
     goal_x = field.own_goal_x()
-    dx = goal_x - ball.x
-    dy = -ball.y
-    length = math.hypot(dx, dy)
-    if length < 1e-6:
-        ux, uy = -1.0, 0.0
-    else:
-        ux, uy = dx / length, dy / length
-    x = ball.x + ux * strategy.defender_cover_depth_m
-    y = ball.y + uy * strategy.defender_cover_depth_m
-
-    # Shift off the pressure lane, away from the nearest legal teammate.
-    game = context.known_game
-    nearest: tuple[float, float] | None = None
-    nearest_d = math.inf
-    for mate_id, robot in context.teammates.items():
-        if mate_id == player_id or robot.pose is None:
-            continue
-        if not is_player_allowed(game, mate_id):
-            continue
-        d = math.hypot(robot.pose.x - x, robot.pose.y - y)
-        if d < nearest_d:
-            nearest_d = d
-            nearest = (robot.pose.x, robot.pose.y)
-    if nearest is not None:
-        shift = (
-            strategy.defender_cover_lateral_m
-            if nearest[1] <= y
-            else -strategy.defender_cover_lateral_m
-        )
-        y += shift
-
+    box_front = goal_x + config.penalty_area_length
+    x = clamp(ball.x - strategy.defender_cover_depth_m, box_front, -0.3)
+    lane_fraction = clamp((x - goal_x) / max(ball.x - goal_x, 1e-6), 0.0, 1.0)
     half_width = strategy.defender_center_half_width_m
-    y = clamp(y, -half_width, half_width)
-    target = field.clamp_inside_field(
-        Pose2D(x, y, field.face_ball_theta(x, y, ball))
+    y = clamp(
+        ball.y * lane_fraction * strategy.defender_cover_center_pull, -half_width, half_width,
     )
-    # The cover never crosses halfway.
-    return Pose2D(
-        min(target.x, -0.3),
-        target.y,
-        field.face_ball_theta(min(target.x, -0.3), target.y, ball),
+    return field.clamp_inside_field(
+        Pose2D(x, y, field.face_ball_theta(x, y, ball))
     )

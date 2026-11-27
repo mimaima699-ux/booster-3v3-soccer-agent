@@ -1,5 +1,5 @@
 id = "com.booster.champion_example"
-version = "1.4.2"
+version = "1.4.9"
 name = { en = "BoosterChampionAgent" }
 logo = "/res/logo.png"
 description = "Booster Champion 3v3 match agent written in Python"

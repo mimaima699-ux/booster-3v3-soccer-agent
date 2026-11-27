@@ -1,21 +1,4 @@
-"""Goalkeeper tactical controller: mode machine, ball velocity, interception.
-
-Pure model layer: no BT, ROS, or runtime imports, so every decision here is
-unit-testable on the host. :class:`GoalkeeperRole` in ``src.play`` is a thin
-adapter that feeds it the ball and applies its decision.
-
-Design notes:
-
-- The keeper has three modes with separate enter/exit radii (hysteresis):
-  POSITION (far ball), INTERCEPT (ball in the defensive vicinity), and
-  EMERGENCY (immediate threat; bypasses the tracking deadband).
-- The lateral target is where the ball-to-goal-center line crosses the keeper
-  line; when a reliable velocity estimate says the ball is closing on our
-  goal, the predicted crossing point is used instead.
-- Ball velocity is estimated from the two most recent observations and is
-  only trusted within ``ball_velocity_min_span_sec`` /
-  ``ball_velocity_max_age_sec``; unreliable estimates never block behavior.
-"""
+"""Goalkeeper positioning and ball trajectory prediction."""
 
 from __future__ import annotations
 
@@ -23,13 +6,14 @@ import math
 from dataclasses import dataclass
 
 from ..soccer_framework import BallState, Pose2D, SoccerConfig
+from .geometry import TeamFieldFrame, clamp, field_to_relative, normalize_angle
 
 
 __all__ = [
-    "KEEPER_MODE_CHALLENGE",
     "KEEPER_MODE_EMERGENCY",
     "KEEPER_MODE_INTERCEPT",
     "KEEPER_MODE_POSITION",
+    "KEEPER_MODE_SWEEP",
     "BallVelocityTracker",
     "KeeperController",
     "KeeperDecision",
@@ -38,65 +22,69 @@ __all__ = [
 
 KEEPER_MODE_POSITION = "POSITION"
 KEEPER_MODE_INTERCEPT = "INTERCEPT"
-KEEPER_MODE_CHALLENGE = "CHALLENGE"
 KEEPER_MODE_EMERGENCY = "EMERGENCY"
+KEEPER_MODE_SWEEP = "SWEEP"
 
 
 @dataclass(frozen=True)
 class KeeperDecision:
-    """One frame's keeper decision.
-
-    ``guard_x``/``lateral_y`` form the guard target: a point on the
-    ball-to-goal-center line at ``keeper_intercept_fraction`` (dynamic depth
-    — advance when the ball is far, retreat when close), clamped to the
-    keeper zone. ``wants_clear`` allows the kick branch; ``challenge`` sends
-    the keeper to attack the ball itself; ``reason`` explains the mode.
-    """
+    """Guard position and permission to clear the ball for this frame."""
 
     mode: str
     guard_x: float
     lateral_y: float
     wants_clear: bool
-    challenge: bool = False
-    reason: str = ""
+
+    @property
+    def claims_ball(self) -> bool:
+        return self.mode == KEEPER_MODE_SWEEP
 
 
 class BallVelocityTracker:
-    """Estimate ball velocity from the two most recent observations.
+    """Estimate velocity from two observations, ignoring stale samples and jumps."""
 
-    Estimates faster than ``max_speed_mps`` are rejected: they come from
-    teleported or re-spotted ball positions, not real ball movement, and
-    extrapolating them would send the keeper to garbage interception points.
-    """
-
-    def __init__(self, max_speed_mps: float | None = None) -> None:
+    def __init__(
+        self,
+        max_speed_mps: float | None = None,
+        max_age_sec: float = math.inf,
+        max_step_m: float = math.inf,
+    ) -> None:
         self._max_speed = max_speed_mps
+        self._max_age = max_age_sec
+        self._max_step = max_step_m
         self._prev: tuple[float, float, float] | None = None  # (x, y, t)
+        self._velocity: tuple[float, float] | None = None
 
     def update(self, ball: BallState, now: float) -> tuple[float, float] | None:
-        """Return ``(vx, vy)`` from the freshest usable sample pair, else None."""
         velocity: tuple[float, float] | None = None
         if self._prev is not None:
-            px, py, pt = self._prev
-            dt = now - pt
-            if 0.0 < dt:
-                candidate = ((ball.x - px) / dt, (ball.y - py) / dt)
-                speed = math.hypot(candidate[0], candidate[1])
-                if self._max_speed is None or speed <= self._max_speed:
-                    velocity = candidate
+            prev_x, prev_y, prev_time = self._prev
+            elapsed = now - prev_time
+            if elapsed == 0.0:
+                return self._velocity
+            dx, dy = ball.x - prev_x, ball.y - prev_y
+            if 0.0 < elapsed <= self._max_age and math.hypot(dx, dy) <= self._max_step:
+                vx = dx / elapsed
+                vy = dy / elapsed
+                if self._max_speed is None or math.hypot(vx, vy) <= self._max_speed:
+                    velocity = (vx, vy)
         self._prev = (ball.x, ball.y, now)
+        self._velocity = velocity
         return velocity
 
 
 class KeeperController:
-    """Stateful per-keeper tactical controller (one instance per goalkeeper)."""
+    """Track shots and claim reachable loose balls in front of goal."""
 
-    def __init__(self, config: SoccerConfig):
+    def __init__(self, config: SoccerConfig) -> None:
         self._config = config
+        self._field = TeamFieldFrame(config)
         self._velocity = BallVelocityTracker(
             max_speed_mps=config.strategy.ball_velocity_max_speed_mps,
+            max_age_sec=config.strategy.ball_velocity_max_age_sec,
+            max_step_m=config.strategy.ball_velocity_max_step_m,
         )
-        self._mode: str = KEEPER_MODE_POSITION
+        self._mode = KEEPER_MODE_POSITION
         self._last_guard: tuple[float, float] | None = None
 
     @property
@@ -104,182 +92,132 @@ class KeeperController:
         return self._mode
 
     def keeper_line_x(self) -> float:
-        strategy = self._config.strategy
-        return -self._config.field_length / 2.0 + strategy.keeper_zone_min_x_offset_m
-
-    def _guard_point(self, ball: BallState) -> tuple[float, float]:
-        """Dynamic-depth guard point on the ball-to-goal-center line.
-
-        Simple-framework geometry: stand at ``keeper_intercept_fraction``
-        along the line from our goal center toward the ball, so the keeper
-        always covers the shooting line — advancing to compress the angle
-        when the ball is far, retreating when it is close. Depth is clamped
-        to the configured zone band.
-        """
-        strategy = self._config.strategy
-        goal_x = -self._config.field_length / 2.0
-        fraction = strategy.keeper_intercept_fraction
-        x = goal_x + (ball.x - goal_x) * fraction
-        y = ball.y * fraction
-        x = max(
-            goal_x + strategy.keeper_zone_min_x_offset_m,
-            min(goal_x + strategy.keeper_zone_max_x_offset_m, x),
+        return (
+            -self._config.field_length / 2.0
+            + self._config.goal_area_length / 2.0
         )
-        half_width = strategy.keeper_zone_half_width_m
-        return x, max(-half_width, min(half_width, y))
 
     def update(
         self,
         ball: BallState,
         keeper_pose: Pose2D,
         now: float,
+        challenger_distance: float = math.inf,
+        has_cover: bool = False,
+        can_clear: bool = True,
     ) -> KeeperDecision:
         strategy = self._config.strategy
         goal_x = -self._config.field_length / 2.0
-        keeper_x = self.keeper_line_x()
-        ball_to_goal = math.hypot(ball.x - goal_x, ball.y)
+        home_x = self.keeper_line_x()
         velocity = self._velocity.update(ball, now)
-        crossing_y = self._predicted_crossing_y(ball, velocity, keeper_x)
-        fast_threat = self._fast_threat(velocity, crossing_y)
+        ball_speed = math.hypot(*velocity) if velocity is not None else None
+        shot_block = self._shot_block(ball, velocity, keeper_pose, goal_x)
+        dx, dy = ball.x - keeper_pose.x, ball.y - keeper_pose.y
+        keeper_distance = math.hypot(dx, dy)
+        in_clear_range = keeper_distance <= strategy.keeper_clear_range_m
 
-        self._update_mode(ball_to_goal, fast_threat)
+        if shot_block is not None:
+            self._mode = KEEPER_MODE_EMERGENCY
+            self._last_guard = None
+            return KeeperDecision(self._mode, shot_block.x, shot_block.y, False)
 
-        if self._mode == KEEPER_MODE_CHALLENGE:
-            # Sweeper-keeper: go win the ball and clear it. The kick branch
-            # is always wanted; the attack subtree gates it by kick range.
-            x, y = self._guard_point(ball)
-            if self._last_guard is not None:
-                x, y = self._last_guard
-            return KeeperDecision(
-                self._mode,
-                x,
-                y,
-                wants_clear=True,
-                challenge=True,
-                reason="slow ball in challenge zone; attack and clear",
-            )
+        lead = (
+            strategy.keeper_sweep_hold_lead_m
+            if self._mode == KEEPER_MODE_SWEEP
+            else strategy.keeper_sweep_lead_m
+        )
+        clearable_ball = (
+            can_clear
+            and ball.x >= goal_x
+            and (ball_speed is None or ball_speed <= strategy.keeper_sweep_max_ball_speed_mps)
+        )
+        heading = math.atan2(dy, dx)
+        turn = abs(normalize_angle(heading - keeper_pose.theta))
+        approach_cost = keeper_distance + strategy.max_linear_speed * turn / max(
+            strategy.max_angular_speed, 1e-6,
+        )
+        recover_at_goal = math.hypot(ball.x - goal_x, ball.y) <= strategy.keeper_uncovered_recovery_m
+        can_reach_from_pose = in_clear_range and (
+            dx >= 0.0 or (recover_at_goal and turn <= math.pi / 2.0)
+        )
+        wins_loose_ball = clearable_ball and (
+            (can_reach_from_pose and keeper_distance + lead <= challenger_distance)
+            or (ball_speed is not None and approach_cost + lead <= challenger_distance)
+            or (recover_at_goal and in_clear_range and approach_cost + lead <= challenger_distance)
+        )
+        if wins_loose_ball and (has_cover or recover_at_goal):
+            self._mode = KEEPER_MODE_SWEEP
+            self._last_guard = None
+            return KeeperDecision(self._mode, ball.x, ball.y, can_reach_from_pose)
 
-        if self._mode == KEEPER_MODE_EMERGENCY:
-            # Fast shot: block the predicted crossing point on the keeper
-            # line; bypass the deadband so the reaction is immediate. Clear
-            # only when the ball is already at the keeper's feet.
-            x = keeper_x
-            y = crossing_y
-            wants_clear = (
-                math.hypot(ball.x - keeper_pose.x, ball.y - keeper_pose.y)
-                <= strategy.keeper_clear_range_m
-            )
-            reason = "fast shot; block crossing point"
+        # Simple-framework guard geometry. Hysteresis is based on the ball's
+        # field x position, so the keeper starts moving before the ball reaches
+        # the penalty area and keeps moving until it is safely back out.
+        if self._mode == KEEPER_MODE_POSITION:
+            threatened = ball.x < strategy.guard_threat_enter_x
         else:
-            # POSITION / INTERCEPT: dynamic-depth guard point on the
-            # ball-to-goal line (the simple-framework geometry).
-            x, y = self._guard_point(ball)
-            wants_clear = False
-            reason = (
-                "ball in defensive vicinity"
-                if self._mode == KEEPER_MODE_INTERCEPT
-                else "ball far; hold guard line"
+            threatened = ball.x < strategy.guard_threat_exit_x
+
+        if threatened:
+            self._mode = KEEPER_MODE_INTERCEPT
+            fraction = strategy.keeper_intercept_fraction
+            keeper_x = goal_x + (ball.x - goal_x) * fraction
+            keeper_x = max(
+                goal_x + strategy.keeper_zone_min_x_offset_m,
+                keeper_x,
             )
+            y = ball.y * fraction
+        else:
+            self._mode = KEEPER_MODE_POSITION
+            keeper_x = home_x
+            y = ball.y * 0.5 if ball.x <= home_x else 0.0
 
         half_width = strategy.keeper_zone_half_width_m
-        y = max(-half_width, min(half_width, y))
-
-        if self._mode != KEEPER_MODE_EMERGENCY and self._last_guard is not None:
+        y = clamp(y, -half_width, half_width)
+        if self._last_guard is not None:
             last_x, last_y = self._last_guard
-            if math.hypot(x - last_x, y - last_y) <= strategy.keeper_track_deadband_m:
-                x, y = last_x, last_y
-        self._last_guard = (x, y)
+            if math.hypot(keeper_x - last_x, y - last_y) <= strategy.keeper_track_deadband_m:
+                keeper_x, y = last_x, last_y
+        self._last_guard = (keeper_x, y)
+        return KeeperDecision(self._mode, keeper_x, y, wins_loose_ball and can_reach_from_pose)
 
-        return KeeperDecision(
-            mode=self._mode,
-            guard_x=x,
-            lateral_y=y,
-            wants_clear=wants_clear,
-            reason=reason,
-        )
-
-    # -- internals ------------------------------------------------------
-
-    def _update_mode(self, ball_to_goal: float, fast_threat: bool) -> None:
-        strategy = self._config.strategy
-
-        if self._mode == KEEPER_MODE_CHALLENGE:
-            if fast_threat and ball_to_goal < strategy.keeper_intercept_enter_radius_m:
-                self._mode = KEEPER_MODE_EMERGENCY
-            elif ball_to_goal > strategy.keeper_challenge_exit_radius_m:
-                self._mode = (
-                    KEEPER_MODE_INTERCEPT
-                    if ball_to_goal < strategy.keeper_intercept_exit_radius_m
-                    else KEEPER_MODE_POSITION
-                )
-        elif self._mode == KEEPER_MODE_EMERGENCY:
-            if not fast_threat and ball_to_goal > strategy.keeper_emergency_exit_radius_m:
-                if ball_to_goal < strategy.keeper_challenge_exit_radius_m:
-                    self._mode = KEEPER_MODE_CHALLENGE
-                elif ball_to_goal < strategy.keeper_intercept_exit_radius_m:
-                    self._mode = KEEPER_MODE_INTERCEPT
-                else:
-                    self._mode = KEEPER_MODE_POSITION
-            elif ball_to_goal > strategy.keeper_intercept_exit_radius_m:
-                self._mode = KEEPER_MODE_POSITION
-        elif self._mode == KEEPER_MODE_INTERCEPT:
-            if fast_threat and ball_to_goal < strategy.keeper_intercept_enter_radius_m:
-                self._mode = KEEPER_MODE_EMERGENCY
-            elif not fast_threat and ball_to_goal < strategy.keeper_challenge_enter_radius_m:
-                self._mode = KEEPER_MODE_CHALLENGE
-            elif ball_to_goal >= strategy.keeper_intercept_exit_radius_m:
-                self._mode = KEEPER_MODE_POSITION
-        else:  # POSITION
-            if fast_threat and ball_to_goal < strategy.keeper_intercept_enter_radius_m:
-                self._mode = KEEPER_MODE_EMERGENCY
-            elif not fast_threat and ball_to_goal < strategy.keeper_challenge_enter_radius_m:
-                self._mode = KEEPER_MODE_CHALLENGE
-            elif ball_to_goal < strategy.keeper_intercept_enter_radius_m:
-                self._mode = KEEPER_MODE_INTERCEPT
-
-    def _fast_threat(
-        self,
-        velocity: tuple[float, float] | None,
-        crossing_y: float,
-    ) -> bool:
-        """A fast ball closing on our goal with a crossing inside the mouth band.
-
-        Slow dribbles never count: those are challenge opportunities, and the
-        keeper should win the ball instead of retreating to its line.
-        """
-        if velocity is None:
-            return False
-        if velocity[0] > -self._config.strategy.ball_fast_closing_mps:
-            return False
-        return abs(crossing_y) <= self._config.goal_width / 2.0 + 0.3
-
-    def _velocity_closes_on_goal(self, velocity: tuple[float, float] | None) -> bool:
-        if velocity is None:
-            return False
-        strategy = self._config.strategy
-        return velocity[0] <= -strategy.ball_velocity_min_toward_goal_mps
-
-    def _predicted_crossing_y(
+    def _shot_block(
         self,
         ball: BallState,
         velocity: tuple[float, float] | None,
-        keeper_x: float,
-    ) -> float:
-        """Best y on the keeper line: velocity crossing when reliable, else the
-        ball-to-goal-center line crossing."""
-        goal_x = -self._config.field_length / 2.0
+        keeper_pose: Pose2D,
+        goal_x: float,
+    ) -> Pose2D | None:
+        strategy = self._config.strategy
+        if velocity is None or velocity[0] > -strategy.ball_velocity_min_toward_goal_mps:
+            return None
+        vx, vy = velocity
+        goal_time = (goal_x - ball.x) / vx
         if (
-            velocity is not None
-            and self._velocity_closes_on_goal(velocity)
-            and velocity[0] < -1e-6
-            and ball.x > keeper_x
+            not 0.0 < goal_time <= strategy.keeper_prediction_horizon_sec
+            or abs(ball.y + vy * goal_time) > self._config.goal_width / 2.0
         ):
-            strategy = self._config.strategy
-            t = (keeper_x - ball.x) / velocity[0]
-            if 0.0 < t <= strategy.keeper_prediction_horizon_sec:
-                return ball.y + velocity[1] * t
-        # Fallback: ball -> goal-center line crossing at the keeper line.
-        if ball.x > keeper_x + 0.2:
-            t = (keeper_x - goal_x) / (ball.x - goal_x)
-            return ball.y * t
-        return ball.y * 0.5
+            return None
+        # Include the current depth as a candidate and sample the whole path
+        # up to the goal, including shots that already passed the keeper.
+        steps = max(1, math.ceil(goal_time / strategy.keeper_intercept_step_sec))
+        current_depth_time = (keeper_pose.x - ball.x) / vx
+        times = [goal_time * index / steps for index in range(steps + 1)]
+        if 0.0 <= current_depth_time <= goal_time:
+            times.append(current_depth_time)
+
+        best: tuple[float, float, Pose2D] | None = None
+        for time in times:
+            target = self._field.clamp_inside_field(
+                Pose2D(ball.x + vx * time, ball.y + vy * time),
+            )
+            relative = field_to_relative(target.x, target.y, keeper_pose)
+            # Linear walking and lateral steps occupy separate gait commands.
+            travel = (
+                abs(relative.x) / max(strategy.max_linear_speed, 1e-6)
+                + abs(relative.y) / max(strategy.keeper_max_lateral_speed_mps, 1e-6)
+            )
+            score = (max(0.0, travel - time), travel)
+            if best is None or score < best[:2]:
+                best = (*score, target)
+        return best[2] if best is not None else None

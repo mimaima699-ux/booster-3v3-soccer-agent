@@ -7,11 +7,15 @@ held by :class:`SoccerKit`.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
+
 from ..soccer_framework import (
     BallState,
     GameControlState,
     Pose2D,
     ReadySlot,
+    RobotState,
     SetPlay,
     SoccerConfig,
 )
@@ -75,6 +79,7 @@ class ReadyStance:
         slot: ReadySlot,
         game: GameControlState,
         ball: BallState | None,
+        opponents: Iterable[RobotState] = (),
     ) -> Pose2D:
         """Compute READY positioning from the current SetPlay and ball position.
 
@@ -82,6 +87,9 @@ class ReadyStance:
         Own restart: stand close to the ball, ready to restart.
         Opponent restart: avoid the configured area around the ball.
         """
+        if game.is_kickoff_for_team(self.config.opponent_team_id()):
+            return self.opponent_kickoff_target(slot, ball, opponents)
+
         own_restart = game.is_restart_for_team(self.config.team_id)
         base_target = self.base_ready_target(slot, own_restart)
         if game.set_play == SetPlay.NONE or ball is None:
@@ -89,6 +97,65 @@ class ReadyStance:
         if own_restart:
             return self._own_set_play_ready_target(slot, ball, base_target)
         return self.field.avoid_ball_target(base_target, ball)
+
+    def opponent_kickoff_target(
+        self,
+        slot: ReadySlot,
+        ball: BallState | None,
+        opponents: Iterable[RobotState] = (),
+    ) -> Pose2D:
+        """Adjust from the kicker's approach while holding a legal kickoff position."""
+        target = (
+            self.goalkeeper_guard_target(ball)
+            if slot == ReadySlot.KEEPER
+            else self.base_ready_target(slot, own_restart=False)
+        )
+        strategy = self.config.strategy
+        x = target.x
+        y = target.y
+        look_at = ball
+        if ball is not None:
+            kicker = min(
+                (robot.pose for robot in opponents if robot.pose is not None),
+                key=lambda pose: math.hypot(pose.x - ball.x, pose.y - ball.y),
+                default=None,
+            )
+            if kicker is not None:
+                distance = math.hypot(kicker.x - ball.x, kicker.y - ball.y)
+                if distance < strategy.opponent_kickoff_kicker_range_m:
+                    look_at = kicker
+                    approach = 1.0 - distance / strategy.opponent_kickoff_kicker_range_m
+                    shade = clamp(
+                        (kicker.y - ball.y) / strategy.opponent_kickoff_kicker_range_m,
+                        -1.0,
+                        1.0,
+                    )
+                    if slot == ReadySlot.KEEPER:
+                        x = min(
+                            self.field.own_goal_x() + strategy.keeper_zone_max_x_offset_m,
+                            target.x + approach * strategy.keeper_kickoff_advance_m,
+                        )
+                        limit = strategy.keeper_zone_half_width_m
+                        y = clamp(target.y + shade * strategy.keeper_kickoff_shade_m, -limit, limit)
+                    else:
+                        advance = strategy.outfield_kickoff_advance_m
+                        x += approach * (advance if slot == ReadySlot.CENTER else advance / 2.0)
+                        y += shade * strategy.restart_kicker_shade_m
+
+        x = self.field.own_half_x(
+            x,
+            margin=self.config.center_circle_radius + strategy.opponent_kickoff_center_margin_m,
+        )
+        if ball is not None:
+            avoid_distance = strategy.opponent_restart_avoid_distance_m
+            if math.hypot(x - ball.x, y - ball.y) < avoid_distance:
+                x = min(x, ball.x - avoid_distance)
+        target = self.field.clamp_inside_field(Pose2D(x, y))
+        heading = (
+            math.atan2(look_at.y - target.y, look_at.x - target.x)
+            if look_at is not None else self.field.attack_theta()
+        )
+        return Pose2D(target.x, target.y, heading)
 
     def goalkeeper_guard_target(
         self,

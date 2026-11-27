@@ -79,25 +79,36 @@ class SoccerStrategyTuning:
     soccer_kick_exit_delay_sec: float = 1.5  #  Delay after exit condition before actually leaving kick mode.
 
     # Kick power scaling
-    # Distance-scaled kick power: short passes stay gentle while long shots and
-    # clears get proportionally stronger. ``soccer_kick_power`` stays the
-    # baseline and the only power for callers that pass no distance.
+    # Distance-scaled power for passes, dribbles, and clearances.
     kick_power_min: float = 1.2  #  Lower clamp of the scaled kick power.
     kick_power_max: float = 4.0  #  Upper clamp of the scaled kick power; excessive values may destabilize the robot.
     kick_power_scale_per_m: float = 0.45  #  Power added per meter of ball-to-target distance.
+    shot_power: float = 5.0  #  Direct shot power in the attacking half.
+    backfield_shot_power: float = 7.0  #  Direct shot power in our half.
 
     # Shot aiming
     # Aim-point search across the opponent goal mouth instead of always the
     # center, so shots go to the corner the opponents cover least.
-    shot_lane_min_score: float = 0.55  #  Minimum lane clearance for a shot candidate.
+    shot_lane_min_score: float = 0.75  #  Require clearance beyond the default opponent radius.
     shot_openness_weight: float = 0.35  #  Blend of aim-point openness vs lane clearance when ranking candidates.
     shot_post_margin_m: float = 0.25  #  Keep aim points this far inside each goal post.
+    shot_aim_error_rad: float = 0.035  #  Test shots against roughly two degrees of heading error.
 
     # Set plays and restarts
     restart_touch_distance: float = 0.45  #  Distance threshold for "touched the ball".
     opponent_restart_avoid_distance_m: float = (
         1.6  #  Rule requires 1.45 m; default adds 0.15 m buffer for a 1.60 m threshold.
     )
+    restart_formation_clearance_m: float = 0.45  #  Extra ball clearance for defensive positioning.
+    restart_kicker_shade_m: float = 0.55  #  Maximum lane shift as the restart taker changes approach.
+    goal_kick_area_margin_m: float = 0.65  #  Stand this far outside the opponent penalty area.
+    goal_kick_cover_gap_m: float = 1.6  #  Depth between the two outfield defenders.
+    corner_keeper_post_fraction: float = 0.65  #  Keeper shades toward the near post.
+    opponent_kickoff_center_margin_m: float = 0.25  #  Extra clearance from the center circle.
+    opponent_kickoff_kicker_range_m: float = 4.0  #  Track opponents approaching within this distance of the ball.
+    keeper_kickoff_advance_m: float = 0.55  #  Maximum advance as the kicker closes in.
+    keeper_kickoff_shade_m: float = 0.50  #  Maximum lateral adjustment toward the kicker's approach.
+    outfield_kickoff_advance_m: float = 1.0  #  Advance toward the legal holding line as the kicker closes.
 
     # Path detour via points
     # First avoidance layer for blockers: draw a line from current pose to target; if an
@@ -145,53 +156,52 @@ class SoccerStrategyTuning:
     defense_enter_ball_x: float = -0.5  #  Ball below this x switches to DEFENSE (m).
     defense_exit_ball_x: float = 0.5  #  Ball above this x returns to ATTACK (m).
 
-    # Goalkeeper zone and behavior. The keeper never leaves this box except to
-    # clear a ball inside its challenge radius, and never crosses halfway.
-    # Guard depth is dynamic: the keeper stands at ``keeper_intercept_fraction``
-    # along the ball-to-goal-center line (ball far -> advance and compress the
-    # angle, ball close -> retreat toward the line), clamped to the band
-    # [min, max] offsets from our goal line. This is the proven simple-framework
-    # goalkeeper geometry.
-    keeper_intercept_fraction: float = 0.4  #  Position along the ball-to-goal line (0 = goal, 1 = ball).
-    keeper_zone_min_x_offset_m: float = 1.1  #  Shallowest guard depth from our goal line (m).
-    keeper_zone_max_x_offset_m: float = 2.5  #  Deepest guard depth from our goal line (m).
+    # Standing depth and loose-ball challenges in front of our goal.
+    keeper_zone_min_x_offset_m: float = 1.1  #  Home depth from our goal line (m).
+    keeper_zone_max_x_offset_m: float = 2.0  #  Maximum depth while tracking the ball (m).
+    keeper_guard_advance_gain: float = 0.45  #  Depth gained per meter of room in front and behind the ball.
     keeper_zone_half_width_m: float = 1.6  #  Lateral clamp of the keeper zone (m).
-    keeper_track_deadband_m: float = 0.15  #  Ignore smaller guard-target corrections (m).
-    keeper_challenge_radius_m: float = 1.7  #  Ball within this of the guard target may be cleared (m).
+    keeper_track_deadband_m: float = 0.10  #  Ignore smaller guard-target corrections (m).
+    keeper_sweep_max_ball_speed_mps: float = 0.8  #  Maximum estimated speed of a loose ball (m/s).
+    keeper_sweep_lead_m: float = 0.35  #  Distance advantage needed to claim a loose ball (m).
+    keeper_sweep_hold_lead_m: float = 0.10  #  Advantage needed to keep an existing claim (m).
+    keeper_clear_approach_m: float = 0.35  #  Approach distance behind the clearance direction (m).
+    keeper_clear_forward_m: float = 2.0  #  Aim upfield even if the keeper has advanced past midfield.
+    keeper_uncovered_recovery_m: float = 1.6  #  Distance from goal within which the keeper can recover alone.
 
-    # Goalkeeper lateral movement. The biped gait accepts single-axis lateral
-    # commands (vy), so the keeper strafes while facing the ball instead of
-    # the turn-walk-turn cycle that produced in-place spinning.
+    # Short goalkeeper corrections use one translation axis at a time.
     keeper_max_lateral_speed_mps: float = 0.5  #  Lateral strafe speed clamp (m/s).
-    keeper_lateral_arrive_m: float = 0.12  #  Lateral arrival threshold (m).
-    keeper_strafe_forward_tolerance_m: float = 0.35  #  Forward error above this falls back to walking (m).
-    keeper_face_ball_turn_threshold: float = 0.35  #  Heading error that triggers a pure face-ball turn (rad).
+    keeper_arrive_distance_m: float = 0.12  #  Position arrival radius (m).
+    keeper_close_move_distance_m: float = 1.0  #  Use direct body-axis steps within this distance.
+    keeper_close_move_gain: float = 1.5  #  Proportional gain for short goalkeeper steps.
+    keeper_arrive_angle_rad: float = 0.10  #  Facing tolerance once the goalkeeper reaches the target.
 
-    # Goalkeeper mode machine: POSITION / INTERCEPT / CHALLENGE / EMERGENCY
-    # with separate enter/exit radii (hysteresis) measured from our goal center.
+    # POSITION / INTERCEPT hysteresis is measured from our goal center.
     keeper_intercept_enter_radius_m: float = 4.5  #  Ball closer than this enters INTERCEPT (m).
     keeper_intercept_exit_radius_m: float = 5.2  #  Ball farther than this returns to POSITION (m).
-    keeper_challenge_enter_radius_m: float = 3.0  #  Slow ball closer than this: keeper attacks and clears (m).
-    keeper_challenge_exit_radius_m: float = 3.6  #  Ball farther than this ends the challenge (m).
-    keeper_emergency_exit_radius_m: float = 2.8  #  Ball farther than this leaves EMERGENCY once slow (m).
-    keeper_clear_range_m: float = 1.1  #  Ball within this of the keeper may be cleared instantly (m).
+    guard_threat_enter_x: float = -1.0  #  Start active interception in our half.
+    guard_threat_exit_x: float = -0.7  #  Return home after the ball leaves our half.
+    keeper_intercept_fraction: float = 0.4  #  Fraction along the ball-to-goal line.
+    keeper_clear_range_m: float = 1.1  #  Maximum keeper-to-ball distance for a slow-ball clearance (m).
 
     # Ball velocity estimation and interception prediction.
     ball_velocity_min_span_sec: float = 0.15  #  Minimum sample pair spacing for a velocity estimate (s).
     ball_velocity_max_age_sec: float = 0.6  #  Older samples are discarded (s).
-    ball_velocity_max_speed_mps: float = 6.0  #  Faster estimates are teleport artifacts, not real ball speed (m/s).
-    ball_fast_closing_mps: float = 1.5  #  Closing speed above which the keeper blocks the line instead of challenging (m/s).
+    ball_velocity_max_speed_mps: float = 12.0  #  Reject implausibly fast ball observations.
+    ball_velocity_max_step_m: float = 1.3  #  Reject discontinuities across successive samples.
     ball_velocity_min_toward_goal_mps: float = 0.4  #  Minimum closing speed counted as a threat (m/s).
-    keeper_prediction_horizon_sec: float = 1.2  #  Maximum ball look-ahead for the crossing point (s).
+    keeper_prediction_horizon_sec: float = 3.5  #  Maximum time to the goal line for shot prediction (s).
+    keeper_intercept_step_sec: float = 0.2  #  Time spacing of candidate interception points.
 
     # Own-goal safety: reject kicks whose line from the ball would enter this
     # half-width band at our goal line.
     own_goal_guard_half_width_m: float = 1.8  #  Guarded band half-width at our goal line (m).
 
-    # Defensive cover for the secondary defender: goal-side of the ball on the
-    # ball-to-goal line, offset off the pressure lane, held in a central band.
+    # Secondary defender protects the middle of the ball-to-goal lane.
     defender_cover_depth_m: float = 1.8  #  Cover point distance goal-side of the ball (m).
-    defender_cover_lateral_m: float = 1.0  #  Lateral offset away from the pressure lane (m).
+    defender_cover_center_pull: float = 0.65  #  Fraction of the lane's lateral position to retain.
+    defense_opponent_control_range_m: float = 1.1  #  Nearby opponent can play the ball.
+    defense_control_margin_m: float = 0.25  #  Distance advantage for switching to defensive cover.
     defender_center_half_width_m: float = 1.5  #  Central band the cover must stay within (m).
 
     # Attacking support offer: ahead-lateral of the ball so passes can exist.

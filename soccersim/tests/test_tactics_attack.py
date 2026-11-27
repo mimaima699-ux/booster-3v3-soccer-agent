@@ -7,6 +7,7 @@ helpers behind tiered kick power and post-corner aiming.
 
 from __future__ import annotations
 
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -83,6 +84,21 @@ class BestShotTargetTests(unittest.TestCase):
         reach = self.config.goal_width / 2.0 - self.config.strategy.shot_post_margin_m
         self.assertAlmostEqual(target.x, self.field.opponent_goal_x())
         self.assertLessEqual(abs(target.y), reach + 1e-9)
+
+    def test_long_shot_leaves_room_for_heading_error_past_an_offset_keeper(self) -> None:
+        goal_x = self.field.opponent_goal_x()
+        context = _context_with_opponents({1: _opponent(1, goal_x - 0.3, 0.82)})
+        context.ball = BallState(-2.0, 0.0)
+        target = best_shot_target(self.config, self.field, self.obstacles, context)
+        self.assertIsNotNone(target)
+        assert target is not None
+        depth = goal_x - context.known_ball.x
+        aim = math.atan2(target.y, depth)
+        error = self.config.strategy.shot_aim_error_rad
+        safe_half_width = self.config.goal_width / 2 - self.config.strategy.shot_post_margin_m
+        self.assertLess(target.y, 0.0)
+        self.assertLessEqual(abs(depth * math.tan(aim - error)), safe_half_width)
+        self.assertLessEqual(abs(depth * math.tan(aim + error)), safe_half_width)
 
     def test_center_keeper_forces_corner_aim(self) -> None:
         goal_x = self.field.opponent_goal_x()

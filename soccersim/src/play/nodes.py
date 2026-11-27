@@ -13,13 +13,18 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import py_trees
 
-from ..soccer_framework import PlayContext, Pose2D, RobotCommand
-from ..behavior_tree.blackboard import BlackboardKeys, BlackboardClient, cmd_key
+from ..soccer_framework import PlayContext, Pose2D, RobotCommand, RobotRuntimeStatus, RobotState
+from ..behavior_tree.blackboard import (
+    BlackboardKeys,
+    BlackboardClient,
+    cmd_key,
+    robot_status_key,
+)
 from ..behavior_tree.nodes.conditions import IsInKickRange
 from .playbook import Playbook, RoleAssignment
 
@@ -64,7 +69,15 @@ class AssignRoles(py_trees.behaviour.Behaviour):
         if context is None:
             self.blackboard.write(BlackboardKeys.ROLES, RoleAssignment())
             return py_trees.common.Status.SUCCESS
-        assignment = self._playbook.assign_roles(context)
+        available_teammates: dict[int, RobotState] = {}
+        for player_id, robot in context.teammates.items():
+            status = self.blackboard.read(robot_status_key(player_id))
+            if isinstance(status, RobotRuntimeStatus) and not status.is_fall_down_normal:
+                continue
+            available_teammates[player_id] = robot
+        assignment = self._playbook.assign_roles(
+            replace(context, teammates=available_teammates),
+        )
         self.blackboard.write(BlackboardKeys.ROLES, assignment)
         return py_trees.common.Status.SUCCESS
 
@@ -206,12 +219,7 @@ class MoveToTarget(py_trees.behaviour.Behaviour):
 
 
 class StrafeToTarget(py_trees.behaviour.Behaviour):
-    """Goalkeeper movement leaf: lateral strafe toward ``target_fn`` while facing.
-
-    Calls :meth:`MotionController.strafe_command`, which keeps the keeper on
-    its line via single-axis ``vy`` commands instead of the turn-walk-turn
-    cycle. Returns FAILURE when ``target_fn`` raises ``ValueError``.
-    """
+    """Move the goalkeeper toward the target with single-axis steps nearby."""
 
     def __init__(
         self,
@@ -220,11 +228,15 @@ class StrafeToTarget(py_trees.behaviour.Behaviour):
         target_fn: TargetFn,
         *,
         reason_fn: ReasonFn | None = None,
+        release_kick_immediately: bool = False,
+        urgent_fn: Callable[[], bool] | None = None,
     ):
         super().__init__(f"StrafeToTarget({player_id})")
         self._kit = kit
         self._player_id = player_id
         self._target_fn = target_fn
+        self._release_kick_immediately = release_kick_immediately
+        self._urgent_fn = urgent_fn
         self._reason_fn: ReasonFn = reason_fn or (
             lambda: _default_move_reason(player_id)
         )
@@ -241,13 +253,14 @@ class StrafeToTarget(py_trees.behaviour.Behaviour):
 
         kit = self._kit
         player_id = self._player_id
+        was_kicking = kit.kicker.is_active(player_id)
         kit.kicker.clear_player(player_id)
-        command = kit.motion.strafe_command(
-            player_id,
-            context,
-            target,
-            self._reason_fn(),
-        )
+        reason = self._reason_fn()
+        if was_kicking and self._release_kick_immediately:
+            command = RobotCommand.stop(f"{reason}: release clearance")
+        else:
+            urgent = self._urgent_fn is not None and self._urgent_fn()
+            command = kit.motion.strafe_command(player_id, context, target, reason, urgent=urgent)
         self.blackboard.write(cmd_key(player_id), command)
         return py_trees.common.Status.SUCCESS
 
@@ -284,7 +297,6 @@ class KickAction(py_trees.behaviour.Behaviour):
 
         ball = context.known_ball
         kick_theta = math.atan2(kt.y - ball.y, kt.x - ball.x)
-        kick_distance = math.hypot(kt.x - ball.x, kt.y - ball.y)
         kit = self._kit
         player_id = self._player_id
         if not kit.targeting.kick_is_own_goal_safe(ball, kick_theta):
@@ -309,7 +321,7 @@ class KickAction(py_trees.behaviour.Behaviour):
             context,
             kick_theta,
             reason,
-            power=kit.targeting.kick_power_for_distance(kick_distance),
+            power=kit.targeting.kick_power_for_target(context, kt),
         )
         self.blackboard.write(cmd_key(player_id), command)
         return py_trees.common.Status.SUCCESS

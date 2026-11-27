@@ -14,6 +14,7 @@ non-PLAY branches. To change tactics, override ``assign_roles``, customize
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -31,6 +32,7 @@ ROLE_CHASER = "chaser"
 ROLE_SUPPORTER = "supporter"
 ROLE_GOALKEEPER = "goalkeeper"
 ROLE_DEFENDER = "defender"
+ROLE_GOAL_COVER = "goal_cover"
 ROLE_NONE = "none"
 
 
@@ -148,13 +150,18 @@ class DefaultPlaybook(Playbook):
         # call register_role(...) after super().__init__(kit). DefenderRole is reserved for explicit custom Playbook registration.
         from .default_roles import (
             ChaserRole,
+            GoalCoverRole,
             GoalkeeperRole,
             SupporterRole,
         )
 
         self.register_role(ChaserRole())
         self.register_role(SupporterRole())
-        self.register_role(GoalkeeperRole())
+        self._goalkeeper = GoalkeeperRole()
+        self.register_role(self._goalkeeper)
+        self.register_role(GoalCoverRole())
+        self._chaser_id: int | None = None
+        self._goal_cover_id: int | None = None
 
     def assign_roles(self, context: PlayContext) -> RoleAssignment:
         chaser_id = self.select_chaser(context)
@@ -169,6 +176,29 @@ class DefaultPlaybook(Playbook):
             else:
                 mapping[player_id] = ROLE_SUPPORTER
 
+        keeper = self.role_registry.get(ROLE_GOALKEEPER)
+        if goalkeeper_id is not None and keeper is self._goalkeeper:
+            decision = self._goalkeeper.prepare(self.kit, goalkeeper_id, context)
+            if decision.claims_ball:
+                if chaser_id is not None:
+                    mapping[chaser_id] = ROLE_SUPPORTER
+                cover_target = self.kit.ready_stance.goalkeeper_guard_target(context.known_ball)
+                game = context.known_game
+                distances = {
+                    mate_id: math.hypot(robot.pose.x - cover_target.x, robot.pose.y - cover_target.y)
+                    for mate_id, robot in context.teammates.items()
+                    if mate_id in mapping and mate_id != goalkeeper_id
+                    and robot.pose is not None and self.kit.is_player_allowed(game, mate_id)
+                }
+                if distances:
+                    cover_id = self._goal_cover_id
+                    if cover_id is None or cover_id not in distances:
+                        cover_id = min(distances, key=lambda mate_id: (distances[mate_id], mate_id))
+                    self._goal_cover_id = cover_id
+                    mapping[cover_id] = ROLE_GOAL_COVER
+                    return RoleAssignment(mapping)
+
+        self._goal_cover_id = None
         return RoleAssignment(mapping)
 
     # Internals
@@ -176,60 +206,32 @@ class DefaultPlaybook(Playbook):
     def _configured_goalkeeper(self) -> int | None:
         return self.kit.config.goalkeeper_player_id()
 
-    def select_chaser(self, context: PlayContext) -> int:
-        """Select this tick's chaser from our team.
-
-        Decision priority:
-        1. ReadySlot eligibility: keeper only joins dangerous balls, side only challenges when suitable.
-        2. ``ball_claim_score``: cost based on distance to ball plus ReadySlot preference.
-        3. Lowest player ID wins ties for predictable debugging.
-
-        If no role is suitable, fall back to the smallest configured player ID so
-        "nobody chases" does not become an extra ``None`` state. Override this method
-        or call another score from :meth:`assign_roles` to change chase strategy.
-        """
+    def select_chaser(self, context: PlayContext) -> int | None:
+        """Keep the current field player on the ball until another has a clear advantage."""
         config = self.kit.config
-        targeting = self.kit.targeting
         ball = context.known_ball
+        game = context.known_game
+        goalkeeper_id = self._configured_goalkeeper()
 
-        candidates: list[int] = []
-        scored: list[tuple[float, int]] = []
+        scores: dict[int, float] = {}
         for player_id in config.player_ids:
-            slot = config.ready_slot_for_player(player_id)
-            if not self._slot_can_challenge(slot, context):
+            if player_id == goalkeeper_id or not self.kit.is_player_allowed(game, player_id):
                 continue
-            candidates.append(player_id)
             robot = context.teammates.get(player_id)
             if robot is None or robot.pose is None:
                 continue
-            scored.append(
-                (targeting.ball_claim_score(slot, robot.pose, ball), player_id)
+            scores[player_id] = self.kit.targeting.ball_claim_score(
+                config.ready_slot_for_player(player_id), robot.pose, ball,
             )
 
-        if not candidates:
-            return min(config.player_ids)
-        if not scored:
-            return min(candidates)
+        if not scores:
+            self._chaser_id = None
+            return None
 
-        tie_margin = config.strategy.teammate_challenge_tie_margin_m
-        # Sort by score ascending; lower is better, and scores within tie_margin are tied.
-        # Ties choose the smallest player ID for predictable debugging.
-        ranked = sorted(scored, key=lambda item: item[0])
-        best_score = ranked[0][0]
-        tied_ids = [
-            player_id for score, player_id in ranked if score <= best_score + tie_margin
-        ]
-        return min(tied_ids)
-
-    def _slot_can_challenge(
-        self,
-        slot: ReadySlot,
-        context: PlayContext,
-    ) -> bool:
-        targeting = self.kit.targeting
-        ball = context.known_ball
-        if slot == ReadySlot.KEEPER:
-            return targeting.ball_in_own_defensive_area(ball)
-        if slot == ReadySlot.SIDE:
-            return targeting.side_should_challenge(context)
-        return True
+        best_id = min(scores, key=lambda player_id: (scores[player_id], player_id))
+        current_id = self._chaser_id
+        margin = config.strategy.teammate_challenge_tie_margin_m
+        if current_id is not None and scores.get(current_id, float("inf")) <= scores[best_id] + margin:
+            return current_id
+        self._chaser_id = best_id
+        return best_id

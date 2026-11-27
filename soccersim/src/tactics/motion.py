@@ -26,7 +26,7 @@ from ..soccer_framework import (
     SoccerConfig,
     PlayContext,
 )
-from .geometry import clamp, field_to_relative, normalize_angle
+from .geometry import clamp, field_to_relative, normalize_angle, relative_to_field
 from .kick_hysteresis import KickHysteresis
 from .navigation import Obstacle, ObstacleCollector
 from .geometry import TeamFieldFrame
@@ -164,51 +164,69 @@ class MotionController:
         context: PlayContext,
         target: Pose2D,
         reason: str,
+        *,
+        urgent: bool = False,
     ) -> RobotCommand:
-        """Goalkeeper lateral movement: face ``target.theta``, strafe via vy.
-
-        The biped gait accepts single-axis lateral commands, so the keeper
-        covers its line without the turn-walk-turn cycle that previously
-        dominated its behavior with in-place spinning. Translation is never
-        blocked on orientation: a large heading error triggers one short
-        face-up turn, small errors are corrected later while strafing stops
-        only for that turn. A forward error beyond
-        ``keeper_strafe_forward_tolerance_m`` falls back to normal walking.
-        """
+        """Use short body-axis steps near the target and walk to distant targets."""
         robot = context.teammates.get(player_id)
         if robot is None or robot.pose is None:
             return RobotCommand.stop(f"{reason}: waiting for pose")
         pose = robot.pose
         strategy = self._config.strategy
 
-        theta_error = normalize_angle(target.theta - pose.theta)
-        if abs(theta_error) > strategy.keeper_face_ball_turn_threshold:
-            # One bounded face-up turn; never a rotation loop.
+        offset = field_to_relative(target.x, target.y, pose)
+        distance = math.hypot(offset.x, offset.y)
+        if distance <= strategy.keeper_arrive_distance_m:
+            heading_error = normalize_angle(target.theta - pose.theta)
+            if urgent or abs(heading_error) <= strategy.keeper_arrive_angle_rad:
+                return RobotCommand.stop(f"{reason}: arrived")
             return RobotCommand(
-                intent=MoveIntent(vyaw=self._angular_velocity(theta_error)),
-                reason=f"{reason} face",
+                intent=MoveIntent(vyaw=self._angular_velocity(heading_error)),
+                reason=f"{reason} align",
             )
 
-        dx = target.x - pose.x
-        dy = target.y - pose.y
-        cos_t = math.cos(pose.theta)
-        sin_t = math.sin(pose.theta)
-        body_x = dx * cos_t + dy * sin_t
-        body_y = -dx * sin_t + dy * cos_t
+        if not urgent and distance > strategy.keeper_close_move_distance_m:
+            return self.move_to_target(
+                player_id, context, target, reason,
+                arrive_distance=strategy.keeper_arrive_distance_m,
+            )
 
-        if abs(body_x) > strategy.keeper_strafe_forward_tolerance_m:
-            # Depth correction needed: use the normal walking controller.
-            return self.move_to_target(player_id, context, target, reason)
+        # Issue one translation axis per step to match the biped gait. Move
+        # along the larger error, or the slower axis when blocking a shot.
+        if urgent:
+            forward_time = abs(offset.x) / max(strategy.max_linear_speed, 1e-6)
+            lateral_time = abs(offset.y) / max(strategy.keeper_max_lateral_speed_mps, 1e-6)
+            use_forward = forward_time > lateral_time
+        else:
+            use_forward = abs(offset.x) >= abs(offset.y)
 
-        if abs(body_y) <= strategy.keeper_lateral_arrive_m:
-            return RobotCommand.stop(f"{reason}: lateral arrived")
+        forward = (offset.x, 0.0)
+        lateral = (0.0, offset.y)
+        steps = (forward, lateral) if use_forward else (lateral, forward)
+        for dx, dy in steps:
+            if abs(dx) + abs(dy) <= 1e-6:
+                continue
+            step_target = relative_to_field(dx, dy, pose)
+            if step_target != self._field.clamp_inside_field(step_target, margin=0.0):
+                continue
+            if not urgent and self._first_blocking_obstacle(player_id, pose, step_target, context) is not None:
+                continue
 
-        vy = clamp(
-            _LINEAR_GAIN * body_y,
-            -strategy.keeper_max_lateral_speed_mps,
-            strategy.keeper_max_lateral_speed_mps,
+            gain = strategy.keeper_close_move_gain
+            forward_limit = strategy.max_linear_speed
+            lateral_limit = strategy.keeper_max_lateral_speed_mps
+            return RobotCommand(
+                intent=MoveIntent(
+                    vx=clamp(gain * dx, -forward_limit, forward_limit),
+                    vy=clamp(gain * dy, -lateral_limit, lateral_limit),
+                ),
+                reason=reason,
+            )
+
+        return self.move_to_target(
+            player_id, context, target, reason,
+            arrive_distance=strategy.keeper_arrive_distance_m,
         )
-        return RobotCommand(intent=MoveIntent(vy=vy), reason=reason)
 
     def approach_target(
         self,
@@ -219,8 +237,8 @@ class MotionController:
         """Approach target behind the ball: step back by ``approach_offset`` opposite the kick direction, then clamp inside the field."""
         return self._field.clamp_inside_field(
             Pose2D(
-                x=ball.x - approach_offset,
-                y=ball.y,
+                x=ball.x - approach_offset * math.cos(kick_theta),
+                y=ball.y - approach_offset * math.sin(kick_theta),
                 theta=kick_theta,
             )
         )

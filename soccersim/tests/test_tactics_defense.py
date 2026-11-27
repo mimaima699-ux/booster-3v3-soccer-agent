@@ -98,7 +98,7 @@ class SupportTargetsTests(unittest.TestCase):
             ball,
         )
         target = support.defender_cover_target(
-            self.config, self.field, 2, context, _allow_all,
+            self.config, self.field, context,
         )
         strategy = self.config.strategy
         # Goal-side: strictly between the ball and our goal, own half only.
@@ -106,7 +106,7 @@ class SupportTargetsTests(unittest.TestCase):
         self.assertLessEqual(target.x, -0.3)
         # Central band respected.
         self.assertLessEqual(abs(target.y), strategy.defender_center_half_width_m)
-        # Offset away from the pressure lane (chaser at y=2 pushes cover down).
+        # Ball on the wing: keep the defender closer to the middle.
         self.assertLess(target.y, 2.0)
 
 

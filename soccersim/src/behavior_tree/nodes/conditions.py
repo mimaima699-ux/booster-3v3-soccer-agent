@@ -23,7 +23,6 @@ from ...soccer_framework import (
     GameControlState,
     GamePhase,
     GameState,
-    SetPlay,
     KickIntent,
     MoveIntent,
     NoopIntent,
@@ -231,7 +230,7 @@ class IsOpponentRestartActive(_ReadOnlyLeaf):
 
 
 class IsOpponentKickoffActive(_ReadOnlyLeaf):
-    """Whether we should hold ready positions while the opponent kickoff is still active."""
+    """Whether the referee still grants the opponent kickoff ownership."""
 
     def __init__(self, kit: "SoccerKit"):
         super().__init__("IsOpponentKickoffActive")
@@ -243,10 +242,8 @@ class IsOpponentKickoffActive(_ReadOnlyLeaf):
             return py_trees.common.Status.FAILURE
         kickoff_active = (
             game.state == GameState.PLAYING
-            and game.set_play == SetPlay.NONE
-            and game.secondary_time > 0
-            and game.has_kicking_team()
-            and game.kicking_team != self._kit.config.team_id
+            and not game.stopped
+            and game.is_kickoff_for_team(self._kit.config.opponent_team_id())
         )
         return (
             py_trees.common.Status.SUCCESS

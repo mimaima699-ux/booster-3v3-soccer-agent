@@ -7,22 +7,25 @@ Baseline roles equal :class:`DefaultPlaybook`. On top:
   logged with the triggering ball position.
 - DEFENSE: the non-chaser field player becomes the cover defender instead of
   the attacking supporter, giving the compact "one pressures, one covers"
-  shape while the goalkeeper stays zone-locked.
+  shape while the goalkeeper tracks the ball near goal.
 - ATTACK: roles stay chaser + supporter; the supporter switches to a forward
   passing offer (see :class:`SupporterRole`).
 - The losing-scoreline press (keeper -> supporter) is config-gated and
   disabled by default: the dedicated-keeper strategy never abandons the goal.
 
-Decisions read only GameController state and ball position, never local timers.
+Decisions are based on the current match snapshot.
 """
 
 from __future__ import annotations
+
+import math
 
 from ..runtime import SoccerKit
 from ..soccer_framework import PlayContext
 from .default_roles import DefenderRole
 from .playbook import (
     ROLE_DEFENDER,
+    ROLE_GOAL_COVER,
     ROLE_SUPPORTER,
     DefaultPlaybook,
     RoleAssignment,
@@ -52,7 +55,7 @@ class TeamPlaybook(DefaultPlaybook):
                 if role == ROLE_SUPPORTER:
                     mapping[player_id] = ROLE_DEFENDER
 
-        if self._should_press(context):
+        if ROLE_GOAL_COVER not in mapping.values() and self._should_press(context):
             goalkeeper = self._configured_goalkeeper()
             if goalkeeper is not None:
                 mapping[goalkeeper] = ROLE_SUPPORTER
@@ -65,9 +68,30 @@ class TeamPlaybook(DefaultPlaybook):
             return
         strategy = self.kit.config.strategy
         previous = self._mode
-        if previous == _MODE_ATTACK and ball.x < strategy.defense_enter_ball_x:
+        nearest_opponent = min(
+            (
+                math.hypot(robot.pose.x - ball.x, robot.pose.y - ball.y)
+                for robot in context.opponents.values() if robot.pose is not None
+            ),
+            default=math.inf,
+        )
+        game = context.game
+        nearest_teammate = min(
+            (
+                math.hypot(robot.pose.x - ball.x, robot.pose.y - ball.y)
+                for player_id, robot in context.teammates.items()
+                if robot.pose is not None
+                and game is not None and self.kit.is_player_allowed(game, player_id)
+            ),
+            default=math.inf,
+        )
+        opponent_controls = (
+            nearest_opponent <= strategy.defense_opponent_control_range_m
+            and nearest_opponent + strategy.defense_control_margin_m < nearest_teammate
+        )
+        if opponent_controls or ball.x < strategy.defense_enter_ball_x:
             self._mode = _MODE_DEFENSE
-        elif previous == _MODE_DEFENSE and ball.x > strategy.defense_exit_ball_x:
+        elif ball.x > strategy.defense_exit_ball_x:
             self._mode = _MODE_ATTACK
         self.kit.team_mode = self._mode
         if self._mode != previous:

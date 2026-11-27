@@ -1,13 +1,4 @@
-"""Chase/kick decisions and pass scoring.
-
-Callers first use :mod:`predicates` to rule out sideline/recovery cases, then use
-this module to choose this tick's kick target:
-
-center view: pass, then shoot, then dribble
-side view: pass if possible, otherwise clear, without shooting
-choose best passing teammate by score
-generic lane-obstacle score
-"""
+"""Kick target selection, lane scoring, and distance-scaled power."""
 
 from __future__ import annotations
 
@@ -60,9 +51,9 @@ def select_kick_target(
     context: PlayContext,
     is_player_allowed: PlayerAllowed,
 ) -> Pose2D:
-    """Decide this tick's aim target for a center chaser.
+    """Decide this tick's aim target for the chaser.
 
-    Decision order: sideline recovery, restart touch, best pass, clear shot lane,
+    Decision order: sideline recovery, restart touch, clear shot lane, best pass,
     and finally dribble forward.
     """
 
@@ -80,6 +71,10 @@ def select_kick_target(
             return Pose2D(teammate.x, teammate.y, 0.0)
         return dribble_target(config, field, ball)
 
+    shot = best_shot_target(config, field, obstacles, context)
+    if shot is not None:
+        return shot
+
     teammate = best_pass_target(
         config, obstacles,
         player_id, context, is_player_allowed,
@@ -87,9 +82,6 @@ def select_kick_target(
     if teammate is not None:
         return Pose2D(teammate.x, teammate.y, 0.0)
 
-    shot = best_shot_target(config, field, obstacles, context)
-    if shot is not None:
-        return shot
     return dribble_target(config, field, ball)
 
 
@@ -197,17 +189,8 @@ def shot_lane_is_clear(
     obstacles: ObstacleCollector,
     context: PlayContext,
 ) -> bool:
-    """Treat a shot lane as directly shootable when clearance score is at least 0.55."""
-
-    ball = context.known_ball
-    return lane_clear_score(
-        config,
-        ball.x,
-        ball.y,
-        field.opponent_goal_x(),
-        0.0,
-        obstacles.opponent_obstacles(context),
-    ) >= 0.55
+    """Return whether the shot selector can find a viable lane into goal."""
+    return best_shot_target(config, field, obstacles, context) is not None
 
 
 def lane_clear_score(
@@ -260,25 +243,35 @@ def best_shot_target(
 ) -> Pose2D | None:
     """Pick the best aim point across the opponent goal mouth, or ``None``.
 
-    Candidates span the goal width inside the posts. Each is scored by lane
-    clearance from opponents blended with openness (how far the nearest
-    opponent is from the aim point), so shots go to the corner the keeper
-    covers least. ``None`` means no candidate reaches ``shot_lane_min_score``
-    and the caller should not shoot now.
+    Candidates and their angular error bounds must cross inside the posts.
+    Score the worst sampled lane and favor space away from opponents.
     """
 
     strategy = config.strategy
     ball = context.known_ball
     goal_x = field.opponent_goal_x()
+    depth = goal_x - ball.x
+    if depth <= 0.0:
+        return None
     reach = max(0.0, config.goal_width / 2.0 - strategy.shot_post_margin_m)
-    steps = max(1, int(reach / 0.35))
+    steps = max(1, math.ceil(reach / 0.18))
     opponents = obstacles.opponent_obstacles(context)
     openness_weight = strategy.shot_openness_weight
 
     best: tuple[float, Pose2D] | None = None
     for index in range(-steps, steps + 1):
         aim_y = reach * index / steps
-        lane = lane_clear_score(config, ball.x, ball.y, goal_x, aim_y, opponents)
+        theta = math.atan2(aim_y - ball.y, depth)
+        angles = (theta - strategy.shot_aim_error_rad, theta, theta + strategy.shot_aim_error_rad)
+        if any(abs(angle) >= math.pi / 2 for angle in angles):
+            continue
+        crossings = tuple(ball.y + depth * math.tan(angle) for angle in angles)
+        if any(abs(y) > reach + 1e-6 for y in crossings):
+            continue
+        lane = min(
+            lane_clear_score(config, ball.x, ball.y, goal_x, y, opponents)
+            for y in crossings
+        )
         if lane < strategy.shot_lane_min_score:
             continue
         openness = 1.0
@@ -289,7 +282,7 @@ def best_shot_target(
             )
             openness = clamp(nearest / 2.0, 0.0, 1.0)
         score = (1.0 - openness_weight) * lane + openness_weight * openness
-        if best is None or score > best[0]:
+        if best is None or (score, -abs(aim_y)) > (best[0], -abs(best[1].y)):
             best = (score, Pose2D(goal_x, aim_y, 0.0))
     return None if best is None else best[1]
 
